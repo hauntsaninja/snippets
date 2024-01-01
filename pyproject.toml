@@ -1,0 +1,122 @@
+[tool.black]
+line-length = 100
+target-version = ['py311']
+skip-magic-trailing-comma = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = [
+    "E", "F", "W", "B", "C4", "PIE", "NPY", "PLE",
+    "DTZ003", "DTZ004",
+    "G010",
+    "PLW0120", "PLW0129", "PLW0711", "PLW2101",  # "PLR6201",
+    "SIM101", "SIM110", "SIM201", "SIM202", "SIM210", "SIM211", "SIM222", "SIM223", "SIM401",
+    "S506",
+    "RET501", "RET502", "RET503",
+    "RUF006", "RUF007", "RUF008", "RUF011", "RUF013", "RUF016", "RUF017", "RUF200",
+    "COM818", "COM819",
+    "ISC001",
+    "PYI016", "PYI018", "PYI025",
+    "PERF102",
+    "UP004", "UP006", "UP007", "UP028", "UP034",
+    "FURB132", "FURB148", "FURB163", "FURB181",
+    "T100",
+    "PT008", "PT012", "PT014",
+    "ASYNC100", "ASYNC102",  # ASYNC101 checks for open() which is much more debatable
+    "ANN2",
+]
+ignore = [
+    "E2",     # leave it to black
+    "E402",   # you usually know what you're doing
+    "E501",   # line too long. black does a good enough job
+    "E701",   # multiple statements on one line. black does a good enough job
+    "E731",   # lambda expression assignments. these are nice sometimes
+    "E741",   # variable names like "l". this isn't a huge problem
+    "B011",   # assert false. no one uses python -O
+    "C408",   # can be nice to use dict with keyword args
+    "PIE790", # there's nothing wrong with pass
+]
+unfixable = [
+    "F841",   # unused variable. ruff keeps the call, but mostly you want to get rid of it all
+    "F601",   # automatic fix might obscure issue
+    "F602",   # automatic fix might obscure issue
+    "B018",   # automatic fix might obscure issue
+    "SIM222", # automatic fix might obscure issue
+    "SIM223", # automatic fix might obscure issue
+    "PT014",  # automatic fix might obscure issue
+]
+
+[tool.ruff.lint]
+preview = true
+explicit-preview-rules = true
+
+[tool.pylint.main]
+allowed-redefined-builtins = ["id", "input", "file"]
+
+disable = [
+    # ===== Don't tell me about things I obviously know I'm doing =====
+    "C0415", "import-outside-toplevel",
+    "W0122", "exec-used",
+    "W0123", "eval-used",
+    "W0212", "protected-access",
+    "W0406", "import-self",
+    "W0603", "global-statement",
+    # ===== Things I basically never want =====
+    # Convention
+    "C0103", "invalid-name",
+    "C0302", "too-many-lines",
+    "C0414", "useless-import-alias",  # explicit re-exports
+    # Refactor
+    "R0401", "cyclic-import",  # interesting in a trivia sort of way
+    "R0901", "too-many-ancestors",
+    "R0902", "too-many-instance-attributes",
+    "R0903", "too-few-public-methods",
+    "R0904", "too-many-public-methods",
+    "R0911", "too-many-return-statements",
+    "R0912", "too-many-branches",
+    "R0913", "too-many-arguments",
+    "R0914", "too-many-locals",
+    "R0915", "too-many-statements",
+    "R0916", "too-many-boolean-expressions",
+    "R1702", "too-many-nested-blocks",
+    "R1735", "use-dict-literal",
+    # Information
+    "I1101", "c-extension-no-member",
+    # Warning
+    "W0107", "unnecessary-pass",
+    "W2301", "unnecessary-ellipsis",
+    "W0223", "abstract-method",
+    "W0706", "try-except-raise",  # useful to call attention to fallibility
+    "W1203", "logging-fstring-interpolation",
+    "W1514", "unspecified-encoding",  # chill out
+    # ===== Things I wouldn't mind, if pylint did them well =====
+    # (aka leave it to a real typechecker, pylint)
+    "E0301", "non-iterator-returned",
+    "E1101", "no-member",
+    "E1129", "not-context-manager",
+    "E1133", "not-an-iterable",
+    "W0221", "arguments-differ",
+    "W0237", "arguments-renamed",
+    "W0632", "unbalanced-tuple-unpacking",
+    # ===== Things I might want to have manually, but aren't good on by default =====
+    # Convention
+    "C0301", "line-too-long",  # leave it to black
+    "C0411", "wrong-import-order",  # leave it to isort
+    "C0412", "ungrouped-imports",  # leave it to isort
+    "C0413", "wrong-import-position",  # leave it to isort
+    "C0114", "missing-module-docstring",
+    "C0115", "missing-class-docstring",
+    "C0116", "missing-function-docstring",
+    # Warning
+    "W0511", "fixme",
+    "W0613", "unused-argument",
+    "W0703", "broad-except",
+    # ===== Probably actually good =====
+    "R1705", "no-else-return",  # I like this in general, but not if the bodies are one-liners
+    "C0200", "consider-using-enumerate",  # Often undesirable if there are assignments in the loop
+    "R0801", "duplicate-code",
+]
+
+[tool.mypy]
+strict = true
