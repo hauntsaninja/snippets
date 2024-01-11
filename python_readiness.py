@@ -17,6 +17,8 @@ import aiohttp
 import packaging.tags
 import packaging.utils
 import packaging.version
+from packaging.requirements import Requirement
+from packaging.specifiers import Specifier
 from packaging.version import Version
 
 
@@ -124,13 +126,13 @@ def safe_version(v: str) -> Version:
         return Version("0")
 
 
-async def project_support(
+async def dist_support(
     session: aiohttp.ClientSession, name: str, python_version: tuple[int, int]
-) -> tuple[Version, PythonSupport]:
+) -> tuple[Version | None, PythonSupport]:
     headers = {"Accept": "application/vnd.pypi.simple.v1+json"}
     async with session.get(f"https://pypi.org/simple/{name}/", headers=headers) as resp:
         if resp.status == 404:
-            return Version("0"), PythonSupport.totally_unknown
+            return None, PythonSupport.totally_unknown
         resp.raise_for_status()
         data = await resp.json()
 
@@ -147,12 +149,12 @@ async def project_support(
     all_versions = sorted((safe_version(v) for v in data["versions"]), reverse=True)
     all_versions = [v for v in all_versions if not v.is_prerelease]
     if not all_versions:
-        return Version("0"), PythonSupport.totally_unknown
+        return None, PythonSupport.totally_unknown
     latest_version = all_versions[0]
 
     support = await support_from_wheels(session, version_wheels[latest_version], python_version)
     if support <= PythonSupport.has_viable_wheel:
-        return latest_version, support
+        return None, support
 
     # Try to figure out which version added the classifier / explicit wheel
     # Just do a dumb linear search
@@ -170,30 +172,130 @@ async def project_support(
     return earliest_supported_version, support
 
 
+def parse_requirements_txt(req_file: str) -> list[str]:
+    def strip_comments(s: str) -> str:
+        try:
+            return s[: s.index("#")].strip()
+        except ValueError:
+            return s.strip()
+
+    entries = []
+    with open(req_file) as f:
+        for line in f:
+            entry = strip_comments(line)
+            if entry:
+                entries.append(entry)
+    return entries
+
+
+def approx_min_satisfying_version(r: Requirement) -> Version:
+    def inner(spec: Specifier) -> Version:
+        if spec.operator == "==":
+            return Version(spec.version.removesuffix(".*"))
+        if spec.operator == "~=":
+            return Version(spec.version)
+        if spec.operator == "!=":
+            return Version("0")
+        if spec.operator == "<=":
+            return Version("0")
+        if spec.operator == ">=":
+            return Version(spec.version)
+        if spec.operator == "<":
+            return Version("0")
+        if spec.operator == ">":
+            return Version(spec.version)
+        raise ValueError(f"Unknown operator {spec.operator}")
+
+    return max((inner(spec) for spec in r.specifier), default=Version("0"))
+
+
+def combine_reqs(reqs: list[Requirement]) -> Requirement:
+    assert reqs
+    combined = Requirement(str(reqs[0]))
+    for req in reqs[1:]:
+        assert combined.name == req.name
+        # It would be nice if there was an officially sanctioned way of combining these
+        if combined.url and req.url and combined.url != req.url:
+            raise RuntimeError(f"Conflicting URLs for {combined.name}: {combined.url} vs {req.url}")
+        combined.url = combined.url or req.url
+        combined.extras.update(req.extras)
+        combined.specifier &= req.specifier
+        if combined.marker and req.marker:
+            # Note that if a marker doesn't pan out, it can still contribute its version specifier
+            # to the combined requirement
+            combined.marker._markers = [combined.marker._markers, "or", req.marker._markers]
+        else:
+            # If one of markers is None, that is an unconditional install
+            combined.marker = None
+    return combined
+
+
+def deduplicate_reqs(reqs: list[Requirement]) -> list[Requirement]:
+    simplified: dict[str, list[Requirement]] = {}
+    for req in reqs:
+        simplified.setdefault(req.name, []).append(req)
+    return [combine_reqs(reqs) for reqs in simplified.values()]
+
+
 async def main() -> None:
     assert sys.version_info >= (3, 9)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--python", default="3.12")
-    parser.add_argument("-p", "--project", action="append")
+    parser.add_argument("-p", "--package", action="append", default=[])
+    parser.add_argument("-r", "--requirement", action="append", default=[])
     args = parser.parse_args()
 
     python_version: tuple[int, int] = tuple(map(int, args.python.split(".")))  # type: ignore
-    assert len(python_version) == 2
-    projects = args.project
-    if not projects:
-        projects = {dist.metadata["Name"] for dist in importlib.metadata.distributions()}
+    if len(python_version) != 2:
+        raise ValueError("Python version must be a major and minor version")
+
+    previous = [Requirement(r) for r in args.package]
+
+    for req_file in args.requirement:
+        previous.extend(Requirement(req) for req in parse_requirements_txt(req_file))
+
+    if not previous:
+        # Default to pulling "requirements" from the current environment
+        venv_versions = {}
+        for dist in importlib.metadata.distributions():
+            metadata = dist.metadata
+            venv_versions[metadata["Name"]] = Version(metadata["Version"]).base_version
+        previous = [Requirement(f"{name}>={version}") for name, version in venv_versions.items()]
+
+    previous = deduplicate_reqs(previous)
 
     async with aiohttp.ClientSession() as session:
-        supports: list[tuple[Version, PythonSupport]] = await asyncio.gather(
-            *(project_support(session, proj, python_version) for proj in projects)
+        supports: list[tuple[Version | None, PythonSupport]] = await asyncio.gather(
+            *(dist_support(session, p.name, python_version) for p in previous)
         )
-        proj_support = dict(zip(projects, supports, strict=True))
-        for proj, (version, support) in sorted(
-            proj_support.items(), key=lambda x: (-x[1][1].value, x[0])
+        package_support = dict(zip(previous, supports, strict=True))
+        for previous_req, (version, support) in sorted(
+            package_support.items(), key=lambda x: (-x[1][1].value, x[0].name)
         ):
-            constraint = f"{proj}>={version}"
-            print(f"{constraint:<25}  # {support.name}")
+            assert (version is None) == (support <= PythonSupport.has_viable_wheel)
+
+            package = previous_req.name
+            if version is None:
+                new_req = Requirement(package)
+            else:
+                new_req = Requirement(f"{package}>={version}")
+
+            PAD = 30
+            previous_req_min = approx_min_satisfying_version(previous_req)
+            if previous_req_min in new_req.specifier:
+                if support > PythonSupport.has_viable_wheel:
+                    print(
+                        f"{str(previous_req):<{PAD}}  # {support.name} (existing requirement ensures support)"
+                    )
+                elif support >= PythonSupport.has_viable_wheel:
+                    print(f"{str(previous_req):<{PAD}}  # {support.name} (cannot ensure support)")
+                else:
+                    print(f"{str(previous_req):<{PAD}}  # {support.name}")
+            elif previous_req.specifier:
+                print(f"{str(new_req):<{PAD}}  # {support.name} (previously: {str(previous_req)})")
+            else:
+                print(f"{str(new_req):<{PAD}}  # {support.name}")
 
 
 if __name__ == "__main__":
