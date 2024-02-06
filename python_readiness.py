@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import collections
 import email.parser
+import email.policy
 import enum
 import functools
 import importlib.metadata
@@ -95,7 +96,7 @@ async def support_from_wheels(
         async with session.get(url) as resp:
             resp.raise_for_status()
             content = io.BytesIO(await resp.read())
-        parser = email.parser.BytesParser()
+        parser = email.parser.BytesParser(policy=email.policy.compat32)
         metadata = parser.parse(content)
     else:
         url = best_wheel["url"]
@@ -109,7 +110,7 @@ async def support_from_wheels(
                     if Path(n).name == "METADATA" and Path(n).parent.suffix == ".dist-info"
                 )
                 with zf.open(metadata_file) as f:
-                    parser = email.parser.BytesParser()
+                    parser = email.parser.BytesParser(policy=email.policy.compat32)
                     metadata = parser.parse(f)
 
     classifiers = set(metadata.get_all("Classifier", []))
