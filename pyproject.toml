@@ -6,6 +6,10 @@ skip-magic-trailing-comma = true
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
+preview = true
+explicit-preview-rules = true
 select = [
     "E", "F", "W", "B", "C4", "PIE", "NPY", "PLE",
     "DTZ003", "DTZ004",
@@ -14,7 +18,7 @@ select = [
     "SIM101", "SIM110", "SIM201", "SIM202", "SIM210", "SIM211", "SIM222", "SIM223", "SIM401",
     "S506",
     "RET501", "RET502", "RET503",
-    "RUF006", "RUF007", "RUF008", "RUF011", "RUF013", "RUF016", "RUF017", "RUF200",
+    "RUF006", "RUF007", "RUF008", "RUF013", "RUF016", "RUF017", "RUF200",
     "COM818", "COM819",
     "ISC001",
     "PYI016", "PYI018", "PYI025",
@@ -28,6 +32,7 @@ select = [
 ]
 ignore = [
     "E2",     # leave it to black
+    "E3",     # leave it to black
     "E402",   # you usually know what you're doing
     "E501",   # line too long. black does a good enough job
     "E701",   # multiple statements on one line. black does a good enough job
@@ -46,10 +51,6 @@ unfixable = [
     "SIM223", # automatic fix might obscure issue
     "PT014",  # automatic fix might obscure issue
 ]
-
-[tool.ruff.lint]
-preview = true
-explicit-preview-rules = true
 
 [tool.pylint.main]
 allowed-redefined-builtins = ["id", "input", "file"]
