@@ -9,22 +9,25 @@ import importlib
 import math
 import os
 import pickle
+import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterator
+
 
 if TYPE_CHECKING:
-    import gitignorefile  # type: ignore[import-untyped]
     import watchfiles
     import zstandard
 else:
-    deps = ["gitignorefile", "watchfiles", "zstandard"]
+    deps = ["watchfiles", "zstandard"]
     for package in deps:
         try:
             globals()[package] = importlib.import_module(package)
@@ -152,29 +155,95 @@ async def open_connection(
 # ==============================
 
 
+class _Entry:
+    __slots__ = ("path", "_cached_stat")
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._cached_stat: os.stat_result | None = None
+
+    @property
+    def stat(self) -> os.stat_result:
+        if self._cached_stat is None:
+            self._cached_stat = os.lstat(self.path)
+        return self._cached_stat
+
+    @property
+    def size(self) -> int:
+        return self.stat.st_size
+
+    @property
+    def mtime(self) -> float:
+        return self.stat.st_mtime
+
+    @property
+    def is_dir(self) -> bool:
+        return stat.S_ISDIR(self.stat.st_mode)
+
+    @property
+    def is_symlink(self) -> bool:
+        return stat.S_ISLNK(self.stat.st_mode)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (_Entry, (self.path,))
+
+
 def collect_file_size_mtimes(
-    path: str, ignore_cache: gitignorefile.Cache
+    path: str, ignore_cache: GitIgnoreCache
 ) -> dict[str, tuple[int, float]]:
-    prefix_len = len(path) + 1
+    assert os.path.isabs(path)
     stats: dict[str, tuple[int, float]] = {}
     try:
-        stack: list[os.DirEntry[str]] = list(os.scandir(path))
+        root = _Entry(path)
     except FileNotFoundError:
         os.makedirs(path, exist_ok=True)
         return {}
-    while stack:
-        item = stack.pop()
-        item_is_dir = item.is_dir(follow_symlinks=False)
-        if ignore_cache(item.path, is_dir=item_is_dir):
-            continue
-        if item_is_dir:
-            stack.extend(os.scandir(item.path))
-            continue
-        if item.is_symlink():
-            # TODO: we don't support symlinks
-            continue
-        item_stat = item.stat(follow_symlinks=False)
-        stats[item.path[prefix_len:]] = (item_stat.st_size, item_stat.st_mtime)
+    if not root.is_dir:
+        return {root.path: (root.size, root.mtime)}
+
+    cache_ver = 216
+    cache_dir = os.path.join(tempfile.gettempdir(), "simple_sync")
+    cache_file = f"scan_{hashlib.sha1(path.encode()).hexdigest()}.pkl.zstd"
+
+    scandir_cache: dict[tuple[str, float], list[_Entry]]
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(os.path.join(cache_dir, cache_file), "rb") as fr:
+            version, scandir_cache = pickle.loads(zstandard.decompress(fr.read()))
+        if version != cache_ver:
+            scandir_cache = {}
+    except Exception:
+        scandir_cache = {}
+
+    def _scandir(entry: _Entry) -> list[_Entry]:
+        key = (entry.path, entry.mtime)
+        if key in scandir_cache:
+            return scandir_cache[key]
+        scandir_cache[key] = (ret := [_Entry(p.path) for p in os.scandir(entry.path)])
+        return ret
+
+    prefix_len = len(path) + 1
+    stack: list[_Entry] = [root]
+    with Timer("collect_file_size_mtimes", log_level=1):
+        while stack:
+            item = stack.pop()
+            item_is_dir = item.is_dir
+
+            if ignore_cache(item.path, is_dir=item_is_dir):
+                continue
+            if item_is_dir:
+                stack.extend(_scandir(item))
+                continue
+            if item.is_symlink:
+                # TODO: we don't support symlinks
+                continue
+            stats[item.path[prefix_len:]] = (item.size, item.mtime)
+
+    try:
+        with open(os.path.join(cache_dir, cache_file), "wb") as fw:
+            fw.write(zstandard.compress(pickle.dumps((cache_ver, scandir_cache)), level=ZSTD_LEVEL))
+    except OSError:
+        pass
     return stats
 
 
@@ -220,9 +289,8 @@ async def forward_to_topo(
 
         return response
 
-    with Timer(f"t_forward to {len(topo)} nodes") as t:
+    with Timer(f"t_forward to {len(topo)} nodes", log_level=1):
         ret = await asyncio.gather(*[forward_one(host, port) for (host, port) in topo])
-    t.log(level=1)
 
     return ret
 
@@ -340,7 +408,7 @@ class Handler:
             log(f"topo: {topo}", level=2)
 
         with Timer("t_setup", log_level=1):
-            ignore_cache = gitignorefile.Cache()
+            ignore_cache = GitIgnoreCache()
             file_size_mtimes_future = asyncio.get_running_loop().run_in_executor(
                 None, collect_file_size_mtimes, dst, ignore_cache
             )
@@ -372,7 +440,7 @@ class Handler:
         with Timer("t_maybe_mtimes", log_level=1):
             if need_mtimes:
                 # while we reduce sizes, mtimes are only from one node
-                ret = {}
+                ret: dict[str, Any] = {}
                 for relpath, size in file_sizes.items():
                     if size == -1:
                         continue
@@ -560,7 +628,7 @@ class Connection:
         return ret
 
 
-def ops_from_changed_paths(src, relpaths: list[str]) -> tuple[list[tuple[Any, ...]], int]:
+def ops_from_changed_paths(src: str, relpaths: list[str]) -> tuple[list[tuple[Any, ...]], int]:
     def helper(relpath: str) -> tuple[Any, ...] | None:
         return op_from_path(path=os.path.join(src, relpath), relpath=relpath)
 
@@ -660,6 +728,8 @@ async def sync_initial_one(
 
     if ops and verbose:
         print(f"Finished remote listing, {len(ops)} files and {n_bytes:_} bytes to sync...")
+        if n_bytes > 10**9:
+            print("(This is a large amount of data, are you syncing the correct locations?)")
 
     total_num_ops = len(ops)
     total_n_bytes = n_bytes
@@ -742,7 +812,7 @@ async def sync_watcher_changes(
     src: str,
     dst: str,
     connections: list[Connection],
-    ignore_cache: gitignorefile.Cache,
+    ignore_cache: GitIgnoreCache,
     changes: set[tuple[watchfiles.Change, str]],
 ) -> None:
     print(f"Detected {len(changes)} changes...")
@@ -753,7 +823,7 @@ async def sync_watcher_changes(
     # and modified changes over deleted changes (since we'll find out whether the file exists
     # or not when reading it)
     for change, path in changes:
-        if ignore_cache(path):
+        if ignore_cache(path, is_dir=False):
             # ignore changes to gitignored files
             continue
         if path in change_by_path:
@@ -808,7 +878,7 @@ async def establish_bootstrapped_connection(
     for _ in range(5):  # arbitrary
         remote = remotes[0]
         forwards = remotes[1:]
-        topo = {f: {} for f in forwards}
+        topo: TreeTopo = {f: {} for f in forwards}
 
         host, port = remote
 
@@ -902,7 +972,7 @@ async def client(
     print(f"Syncing {src} to {dst} on {len(remotes)} remote nodes...\n")
 
     print("Bootstrapping...")
-    ignore_cache = gitignorefile.Cache()
+    ignore_cache = GitIgnoreCache()
     local_size_mtimes_future = asyncio.get_running_loop().run_in_executor(
         None, collect_file_size_mtimes, src, ignore_cache
     )
@@ -968,6 +1038,234 @@ async def benchmark(host: str, port: int) -> None:
             await writer.wait_closed()
         if t_overall.time() > 10:
             break
+
+
+# ==============================
+# Gitignore
+# ==============================
+
+
+# Based on:
+# https://git-scm.com/docs/gitignore
+# https://github.com/excitoon/gitignorefile
+# https://github.com/mherrmann/gitignore_parser
+# https://github.com/cpburnz/python-pathspec
+
+
+class GitIgnoreCache:
+    def __init__(self) -> None:
+        self._gitignores: dict[tuple[str, ...], list[GitIgnore]] = {}
+
+    def __call__(self, path: str | _PathParts, is_dir: bool) -> bool:
+        """Checks whether the specified path is ignored."""
+        assert isinstance(path, str)
+        path = _PathParts.from_str(path)
+
+        add_to_children: list[tuple[_PathParts, list[GitIgnore], list[_PathParts]]] = []
+        copy_from_parent: list[_PathParts] = []
+        for parent in path.parents():
+            if parent.parts in self._gitignores:
+                break
+
+            gitignores = []
+            parent_fspath = parent.fspath()
+            for name in [".gitignore", ".git/info/exclude"]:
+                ignore_path = os.path.join(parent_fspath, name)
+                if os.path.isfile(ignore_path):
+                    with open(ignore_path) as ignore_file:
+                        gitignore = GitIgnore.parse(ignore_file.read(), parent)
+                    if gitignore:
+                        gitignores.append(gitignore)
+
+            if gitignores:
+                add_to_children.append((parent, gitignores, copy_from_parent))
+                copy_from_parent = []
+            else:
+                copy_from_parent.append(parent)
+        else:
+            parent = _PathParts(tuple())  # null path
+            self._gitignores[()] = []
+
+        for plain_child in copy_from_parent:
+            assert plain_child.parts not in self._gitignores
+            self._gitignores[plain_child.parts] = self._gitignores[parent.parts]
+
+        for parent, _, copy_from_parent in reversed(add_to_children):
+            assert parent.parts not in self._gitignores
+            self._gitignores[parent.parts] = self._gitignores[parent.parts[:-1]].copy()
+
+            for source_parent, gitignores, _ in reversed(add_to_children):
+                self._gitignores[parent.parts].extend(gitignores)
+                if source_parent == parent:
+                    break
+
+            self._gitignores[parent.parts].reverse()
+
+            for plain_child in copy_from_parent:
+                assert plain_child.parts not in self._gitignores
+                self._gitignores[plain_child.parts] = self._gitignores[parent.parts]
+
+        return any(m.match(path, is_dir=is_dir) for m in self._gitignores[path.parts[:-1]])
+
+
+_path_split: Callable[[str], list[str]]
+if os.altsep is not None:
+    _all_seps_pattern = re.compile(f"[{re.escape(os.sep)}{re.escape(os.altsep)}]")
+    _path_split = lambda path: re.split(_all_seps_pattern, path)
+else:
+    _path_split = lambda path: path.split(os.sep)
+
+
+class _PathParts:
+    __slots__ = "parts"
+
+    def __init__(self, parts: tuple[str, ...]) -> None:
+        self.parts = parts
+
+    @classmethod
+    def from_str(cls, path: str) -> _PathParts:
+        return cls(tuple(_path_split(path)))
+
+    def relpath_posix(self, base_path: _PathParts) -> str | None:
+        if self.parts[: len(base_path.parts)] != base_path.parts:
+            return None
+        return "/".join(self.parts[len(base_path.parts) :])
+
+    def parents(self) -> Iterator[_PathParts]:
+        for i in range(len(self.parts) - 1, 0, -1):
+            yield _PathParts(self.parts[:i])
+
+    def dirname(self) -> _PathParts:
+        return _PathParts(self.parts[:-1])
+
+    def fspath(self) -> str:
+        return os.sep.join(self.parts) if self.parts != ("",) else os.sep
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.parts!r})"
+
+
+def _rule_from_pattern(pattern: str) -> tuple[str, bool] | None:
+    """Returns a tuple of (regexp, negation) for a `.gitignore` match pattern."""
+
+    # A blank line matches no files, so it can serve as a separator for readability
+    # A line starting with # serves as a comment
+    if not pattern.lstrip() or pattern.lstrip().startswith("#"):
+        return None
+
+    # Put a backslash ("\") in front of the first hash for patterns that begin with a hash
+    if pattern.startswith("\\#"):
+        pattern = pattern[1:]
+
+    # Trailing spaces are ignored unless they are quoted with backslash ("\")
+    while pattern.endswith(" ") and not pattern.endswith("\\ "):
+        pattern = pattern[:-1]
+    if pattern.endswith("\\ "):
+        pattern = pattern[:-2] + " "
+
+    # An optional prefix "!" which negates the pattern
+    if pattern.startswith("!"):
+        negation = True
+        pattern = pattern[1:]
+    else:
+        negation = False
+
+    # If there is a separator at the beginning or middle (or both) of the pattern, then the
+    # pattern is relative to the directory level of the particular .gitignore file itself
+    anchored = "/" in pattern[:-1]
+    if pattern.startswith("/"):
+        pattern = pattern[1:]
+    if pattern.startswith("**"):
+        pattern = pattern[2:]
+        if pattern.startswith("/"):
+            pattern = pattern[1:]
+        anchored = False
+
+    assert pattern
+    n = len(pattern)
+
+    def callback(m: re.Match[str]) -> str:
+        c = m.group(0)
+        if c == "/**/":
+            return "/|/.+/"  # a/**/b matches a/b
+        if c == "**":
+            if m.start() == 0 or m.end() == n:
+                return ".*"
+            return "[^/]*"  # "other consecutive asterisks"
+        if c == "*":
+            return "[^/]*"
+        if c == "?":
+            return "[^/]"
+        if c.startswith("[") and c.endswith("]"):
+            stuff = c[1:-1]
+            if not stuff:
+                return "(?!)"  # empty range: never match
+            stuff = stuff.replace("\\", "\\\\")
+            if stuff == "!":
+                return "."  # negated empty range: match any character
+            if stuff[0] == "!":
+                stuff = "^" + stuff[1:]
+            elif stuff[0] in ("^", "["):
+                stuff = "\\" + stuff
+            return f"[{stuff}]"
+        return re.escape(c)
+
+    regexp = re.sub(r"/\*\*/|\*\*|\*|\?|\[.*\]|.", callback, pattern)
+    if not anchored:
+        regexp = "(?:^|.+/)" + regexp
+    if pattern.endswith("/"):
+        regexp += "(?:.+)?$"
+    else:
+        regexp += "(?:/.*)?$"
+
+    return regexp, negation
+
+
+class GitIgnore:
+    def __init__(
+        self, rules: list[tuple[re.Pattern[str], bool]], base_path: str | _PathParts
+    ) -> None:
+        self._rules = rules
+        if isinstance(base_path, str):
+            base_path = _PathParts.from_str(base_path)
+        self._base_path = base_path
+
+    @classmethod
+    def parse(cls, contents: str, dirname: str | _PathParts) -> GitIgnore | None:
+        rules: list[tuple[str, bool]] = []
+        for line in contents.splitlines():
+            if rule := _rule_from_pattern(line):
+                rules.append(rule)
+                pass
+        if not rules:
+            return None
+
+        batched_rules: list[tuple[re.Pattern[str], bool]] = []
+        current_regexp = [rules[0][0]]
+        current_negation = rules[0][1]
+        for regexp, negation in rules[1:]:
+            if negation == current_negation:
+                current_regexp.append(regexp)
+            else:
+                batched_rules.append((re.compile("|".join(current_regexp)), current_negation))
+                current_regexp = [regexp]
+                current_negation = negation
+        batched_rules.append((re.compile("|".join(current_regexp)), current_negation))
+        return GitIgnore(batched_rules, dirname)
+
+    def match(self, path: str | _PathParts, is_dir: bool) -> bool:
+        if isinstance(path, str):
+            path = _PathParts.from_str(path)
+        relpath = path.relpath_posix(self._base_path)
+        if relpath is None:
+            return False
+        if is_dir and not relpath.endswith("/"):
+            relpath += "/"
+        matched = False
+        for pattern, negation in self._rules:
+            if pattern.fullmatch(relpath):
+                matched = not negation
+        return matched
 
 
 # ==============================
