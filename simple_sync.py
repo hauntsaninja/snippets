@@ -22,7 +22,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterator
 
-
 if TYPE_CHECKING:
     import watchfiles
     import zstandard
@@ -193,13 +192,12 @@ def collect_file_size_mtimes(
 ) -> dict[str, tuple[int, float]]:
     assert os.path.isabs(path)
     stats: dict[str, tuple[int, float]] = {}
+    root = _Entry(path)
     try:
-        root = _Entry(path)
+        if not root.is_dir:
+            return {".": (root.size, root.mtime)}
     except FileNotFoundError:
-        os.makedirs(path, exist_ok=True)
         return {}
-    if not root.is_dir:
-        return {root.path: (root.size, root.mtime)}
 
     cache_ver = 216
     cache_dir = os.path.join(tempfile.gettempdir(), "simple_sync")
@@ -245,6 +243,12 @@ def collect_file_size_mtimes(
     except OSError:
         pass
     return stats
+
+
+def dot_safe_join(base: str, relpath: str) -> str:
+    if relpath == ".":
+        return base
+    return os.path.join(base, relpath)
 
 
 # ==============================
@@ -298,7 +302,7 @@ async def forward_to_topo(
 def _perform_op(op: tuple[Any, ...], dst: str) -> None:
     op_type = op[0]
     if op_type == FileOperation.WRITE:
-        path = os.path.join(dst, op[1])
+        path = dot_safe_join(dst, op[1])
         contents = op[2]
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -314,7 +318,7 @@ def _perform_op(op: tuple[Any, ...], dst: str) -> None:
             with open(path, "wb") as f:
                 f.write(contents)
     elif op_type == FileOperation.DELETE:
-        path = os.path.join(dst, op[1])
+        path = dot_safe_join(dst, op[1])
         log(f"Deleting {path}", level=2)
         try:
             os.remove(path)
@@ -630,7 +634,7 @@ class Connection:
 
 def ops_from_changed_paths(src: str, relpaths: list[str]) -> tuple[list[tuple[Any, ...]], int]:
     def helper(relpath: str) -> tuple[Any, ...] | None:
-        return op_from_path(path=os.path.join(src, relpath), relpath=relpath)
+        return op_from_path(path=dot_safe_join(src, relpath), relpath=relpath)
 
     ops = []
     n_bytes = 0
