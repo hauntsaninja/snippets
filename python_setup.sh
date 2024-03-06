@@ -26,11 +26,21 @@ canonicalize_arch() {
 }
 
 python_setup() (
+    # To use, do something like:
+    # ```
+    # source python_setup.sh
+    # python_setup 3.11.7 arm64
+    # ```
+    # Note that this uses pyenv as a convenient way to build and house the Pythons, but doesn't
+    # actually really use or install pyenv. You can just use the binaries in e.g.
+    # ~/.pyenv/versions/3.12.2/bin/python like normal without thinking about pyenv at all.
     set -eux
 
     PYTHON_VERSION="${1:-3.11.7}"
     ARCH_EXPECTED="${2:-$(canonicalize_arch $(arch))}"
 
+    # TODO: look into something like https://github.com/AdrianDAlessandro/pyenv-suffix
+    # to have Python version on both architectures
     print_bold_green "Setting up Python ${PYTHON_VERSION} for ${ARCH_EXPECTED}"
 
     BREW_ROOT_X86=/usr/local
@@ -49,7 +59,9 @@ python_setup() (
     PYENV="$PYENV_ROOT/bin/pyenv"
 
     if [ $(canonicalize_arch $(arch)) != "${ARCH_EXPECTED}" ]; then
-        print_bold_red "ERROR: expected arch ${ARCH_EXPECTED}, but running $(arch)"
+        print_bold_red "ERROR: expected arch ${ARCH_EXPECTED}, but running $(arch). \
+Create a shell with arch -${ARCH_EXPECTED} zsh and try again \
+(once the binary is built you should never need to do that again)."
         return 1
     fi
 
