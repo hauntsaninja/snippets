@@ -9,7 +9,9 @@ import enum
 import functools
 import importlib.metadata
 import io
+import pathlib
 import sys
+import sysconfig
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -238,6 +240,11 @@ def deduplicate_reqs(reqs: list[Requirement]) -> list[Requirement]:
     return [combine_reqs(reqs) for reqs in simplified.values()]
 
 
+@functools.lru_cache()
+def sysconfig_purelib() -> Path:
+    return Path(sysconfig.get_paths()["purelib"])
+
+
 async def main() -> None:
     assert sys.version_info >= (3, 9)
 
@@ -260,6 +267,13 @@ async def main() -> None:
         # Default to pulling "requirements" from the current environment
         venv_versions = {}
         for dist in importlib.metadata.distributions():
+            if (
+                isinstance(dist, importlib.metadata.PathDistribution)
+                and (dist_path := getattr(dist, "_path", None))
+                and isinstance(dist_path, pathlib.Path)
+                and not dist_path.is_relative_to(sysconfig_purelib())
+            ):
+                continue
             metadata = dist.metadata
             venv_versions[metadata["Name"]] = Version(metadata["Version"]).base_version
         previous = [Requirement(f"{name}>={version}") for name, version in venv_versions.items()]
