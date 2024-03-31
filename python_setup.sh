@@ -139,10 +139,10 @@ assert "--with-lto" in sysconfig.get_config_var("CONFIG_ARGS")
         print_bold_red "ERROR: pyenv failed to correctly propagate configuration when building Python"
         return 1
     fi
-    if ! "$SHELL" --login -c '
-        eval "$($PYENV init --path)"
+    if ! "$SHELL" --login -c "
+        eval \"\$($PYENV init --path)\"
         python --version | grep -q $PYTHON_VERSION
-    '; then
+    "; then
         print_bold_red 'ERROR: pyenv setup failed'
         return 1
     fi
