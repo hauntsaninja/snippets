@@ -10,6 +10,7 @@ import functools
 import importlib.metadata
 import io
 import pathlib
+import re
 import sys
 import sysconfig
 import zipfile
@@ -212,11 +213,15 @@ def approx_min_satisfying_version(r: Requirement) -> Version:
     return max((inner(spec) for spec in r.specifier), default=Version("0"))
 
 
+def canonical_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 def combine_reqs(reqs: list[Requirement]) -> Requirement:
     assert reqs
     combined = Requirement(str(reqs[0]))
     for req in reqs[1:]:
-        assert combined.name == req.name
+        assert canonical_name(combined.name) == canonical_name(req.name)
         # It would be nice if there was an officially sanctioned way of combining these
         if combined.url and req.url and combined.url != req.url:
             raise RuntimeError(f"Conflicting URLs for {combined.name}: {combined.url} vs {req.url}")
@@ -236,7 +241,7 @@ def combine_reqs(reqs: list[Requirement]) -> Requirement:
 def deduplicate_reqs(reqs: list[Requirement]) -> list[Requirement]:
     simplified: dict[str, list[Requirement]] = {}
     for req in reqs:
-        simplified.setdefault(req.name, []).append(req)
+        simplified.setdefault(canonical_name(req.name), []).append(req)
     return [combine_reqs(reqs) for reqs in simplified.values()]
 
 
