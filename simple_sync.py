@@ -141,6 +141,7 @@ async def open_connection(
     reader = asyncio.StreamReader(limit=STREAM_READER_LIMIT, loop=loop)
     protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
     sock = get_socket()
+    sock.setblocking(False)
     sock.settimeout(10)
     sock.connect((host, port))
     sock.settimeout(None)
@@ -199,30 +200,38 @@ def collect_file_size_mtimes(
     except FileNotFoundError:
         return {}
 
-    cache_ver = 216
+    cache_ver = 217
     cache_dir = os.path.join(tempfile.gettempdir(), "simple_sync")
     cache_file = f"scan_{hashlib.sha1(path.encode()).hexdigest()}.pkl.zstd"
 
-    scandir_cache: dict[tuple[str, float], list[_Entry]]
-    try:
-        os.makedirs(cache_dir, exist_ok=True)
-        with open(os.path.join(cache_dir, cache_file), "rb") as fr:
-            version, scandir_cache = pickle.loads(zstandard.decompress(fr.read()))
-        if version != cache_ver:
+    scandir_cache: dict[str, tuple[float, list[str]]]
+    with Timer("cfsm_cache_load", log_level=1):
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(os.path.join(cache_dir, cache_file), "rb") as fr:
+                version, scandir_cache = pickle.loads(zstandard.decompress(fr.read()))
+            if version != cache_ver:
+                scandir_cache = {}
+        except Exception:
             scandir_cache = {}
-    except Exception:
-        scandir_cache = {}
 
     def _scandir(entry: _Entry) -> list[_Entry]:
-        key = (entry.path, entry.mtime)
-        if key in scandir_cache:
-            return scandir_cache[key]
-        scandir_cache[key] = (ret := [_Entry(p.path) for p in os.scandir(entry.path)])
+        dirname = entry.path
+        if dirname in scandir_cache:
+            mtime, names = scandir_cache[dirname]
+            if mtime == entry.mtime:
+                return [_Entry(os.path.join(dirname, f)) for f in names]
+        ret = []
+        cache_entry = []
+        for p in os.scandir(entry.path):
+            ret.append(_Entry(p.path))
+            cache_entry.append(p.name)
+        scandir_cache[dirname] = (entry.mtime, cache_entry)
         return ret
 
-    prefix_len = len(path) + 1
-    stack: list[_Entry] = [root]
-    with Timer("collect_file_size_mtimes", log_level=1):
+    with Timer("cfsm_scan", log_level=1):
+        prefix_len = len(path) + 1
+        stack: list[_Entry] = [root]
         while stack:
             item = stack.pop()
             item_is_dir = item.is_dir
@@ -237,11 +246,14 @@ def collect_file_size_mtimes(
                 continue
             stats[item.path[prefix_len:]] = (item.size, item.mtime)
 
-    try:
-        with open(os.path.join(cache_dir, cache_file), "wb") as fw:
-            fw.write(zstandard.compress(pickle.dumps((cache_ver, scandir_cache)), level=ZSTD_LEVEL))
-    except OSError:
-        pass
+    with Timer("cfsm_cache_dump", log_level=1):
+        try:
+            with open(os.path.join(cache_dir, cache_file), "wb") as fw:
+                fw.write(
+                    zstandard.compress(pickle.dumps((cache_ver, scandir_cache)), level=ZSTD_LEVEL)
+                )
+        except OSError:
+            pass
     return stats
 
 
@@ -276,20 +288,24 @@ async def forward_to_topo(
     topo: TreeTopo, op: ServerOperation, payloads: list[bytes]
 ) -> list[bytes]:
     async def forward_one(host: str, port: int) -> bytes:
-        reader, writer = await open_connection(host, port)
-        buf = bytearray()
-        buf.extend(op.to_bytes(8, byteorder="big"))
-        for payload in payloads:
-            write_length_prefixed(buf, payload)
-        write_length_prefixed(buf, pickle.dumps(topo[(host, port)]))
+        try:
+            reader, writer = await open_connection(host, port)
+            buf = bytearray()
+            buf.extend(op.to_bytes(8, byteorder="big"))
+            for payload in payloads:
+                write_length_prefixed(buf, payload)
+            write_length_prefixed(buf, pickle.dumps(topo[(host, port)]))
 
-        writer.write(buf)
-        await writer.drain()
+            writer.write(buf)
+            await writer.drain()
 
-        response = await read_length_prefixed_async(reader)
+            response = await read_length_prefixed_async(reader)
 
-        writer.close()
-        await writer.wait_closed()
+            writer.close()
+            await writer.wait_closed()
+        except Exception as e:
+            e.add_note(f"Exception occurred forwarding to {host}:{port}")
+            raise
 
         return response
 
@@ -655,9 +671,10 @@ async def sync_ops(dst: str, ops: list[tuple[Any, ...]], connections: list[Conne
     if not ops:
         return
 
-    if len(ops) <= 10:
-        for op in ops:
-            log(f"{FileOperation(op[0]).name}, {op[1]}", level=1)
+    for op in ops[:10]:
+        log(f"{FileOperation(op[0]).name}, {op[1]}", level=1)
+    if len(ops) > 10:
+        log(f"... and {len(ops) - 10} more", level=1)
 
     with Timer("t_dump", log_level=1):
         payload = zstandard.compress(pickle.dumps((dst, ops)), level=ZSTD_LEVEL)
@@ -685,7 +702,7 @@ async def sync_ops(dst: str, ops: list[tuple[Any, ...]], connections: list[Conne
             raise RuntimeError("Failed to sync, check server side logs")
 
 
-async def sync_initial_one(
+async def _sync_initial_one(
     src: str,
     dst: str,
     local_size_mtimes_future: asyncio.Future[dict[str, tuple[int, float]]],
@@ -790,7 +807,7 @@ async def sync_initial(
     with Timer("t_sync", log_level=1):
         ops_and_bytes = await asyncio.gather(
             *[
-                sync_initial_one(
+                _sync_initial_one(
                     src=src,
                     dst=dst,
                     local_size_mtimes_future=local_size_mtimes_future,
@@ -956,7 +973,7 @@ async def client(
     *,
     src: str,
     dst: str,
-    remotes: list[tuple[str, int]],
+    remote_groups: dict[str, list[tuple[str, int]]],
     run_callback: Callable[[str, str, str], Awaitable[None]],
     skip_mtime: bool = False,
 ) -> None:
@@ -973,7 +990,9 @@ async def client(
         f"{'=' * 29}\n"
     )
 
-    print(f"Syncing {src} to {dst} on {len(remotes)} remote nodes...\n")
+    for group, remotes in remote_groups.items():
+        print(f"Syncing {src} to {dst} on {len(remotes)} remote nodes in {group}...")
+    print()
 
     print("Bootstrapping...")
     ignore_cache = GitIgnoreCache()
@@ -982,11 +1001,18 @@ async def client(
     )
 
     with Timer() as t_bootstrap:
-        connections = [await establish_bootstrapped_connection(remotes, run_callback)]
+        connections = await asyncio.gather(
+            *[
+                establish_bootstrapped_connection(remotes, run_callback)
+                for _, remotes in remote_groups.items()
+            ]
+        )
 
     print(f"Bootstrapped remote daemons in {t_bootstrap}\n")
 
     # Start running the watcher before the initial sync so we don't miss any changes
+    # (also note watchfiles does a little bit of filtering itself that should usually be redundant
+    # with our gitignore filtering)
     watcher = watchfiles.awatch(src)
     watcher_init = asyncio.ensure_future(anext(watcher))
 
@@ -1109,7 +1135,10 @@ class GitIgnoreCache:
                 assert plain_child.parts not in self._gitignores
                 self._gitignores[plain_child.parts] = self._gitignores[parent.parts]
 
-        return any(m.match(path, is_dir=is_dir) for m in self._gitignores[path.parts[:-1]])
+        for m in self._gitignores[path.parts[:-1]]:  # noqa: SIM110
+            if m.match(path, is_dir=is_dir):
+                return True
+        return False
 
 
 _path_split: Callable[[str], list[str]]
@@ -1191,7 +1220,7 @@ def _rule_from_pattern(pattern: str) -> tuple[str, bool] | None:
     def callback(m: re.Match[str]) -> str:
         c = m.group(0)
         if c == "/**/":
-            return "/|/.+/"  # a/**/b matches a/b
+            return "(?:/|/.+/)"  # a/**/b matches a/b
         if c == "**":
             if m.start() == 0 or m.end() == n:
                 return ".*"
