@@ -338,15 +338,19 @@ def _perform_op(op: tuple[Any, ...], dst: str) -> None:
         log(f"Deleting {path}", level=2)
         try:
             os.remove(path)
-        except (FileNotFoundError, IsADirectoryError):
+        except FileNotFoundError:
             # If the file is not found, we've already done our job
-            # If the file is now a directory, that's fine too
             pass
+        except IsADirectoryError:
+            # If we e.g. renamed a directory, this will be a delete op for the old name
+            # Note we should process deletes before writes
+            shutil.rmtree(path, ignore_errors=True)
     else:
         raise ValueError(f"Unknown file operation: {op}")
 
 
 def _perform_ops(ops: list[tuple[Any, ...]], dst: str) -> None:
+    # If you're tempted to parallelise this, make sure to handle deletes first
     for op in ops:
         _perform_op(op, dst)
 
@@ -600,21 +604,35 @@ def self_version() -> bytes:
 # ==============================
 
 
-def op_from_path(*, path: str, relpath: str) -> tuple[Any, ...] | None:
+def op_from_path(*, path: str, relpath: str) -> list[tuple[Any, ...]]:
     try:
-        if os.path.islink(path):
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode):
             # TODO: we don't support symlinks
-            return None
-        try:
-            with open(path, "rb") as f:
-                contents = f.read()
-        except IsADirectoryError:
-            # I think this happens if a file is deleted and a directory is created?
-            return None
+            return []
+
+        if stat.S_ISDIR(st.st_mode):
+            # collect_file_size_mtimes only deals with files, but it's possible to get directories
+            # from the file watching loop. In practice, this comes up if a directory was renamed.
+            # TODO: this is a little sketchy, doesn't account for gitignore, isn't parallel
+            ret = []
+            for root, _, files in os.walk(path):
+                for file in files:
+                    subpath = os.path.join(root, file)
+                    ret.extend(
+                        op_from_path(
+                            path=subpath,
+                            relpath=os.path.join(relpath, os.path.relpath(subpath, start=path)),
+                        )
+                    )
+            return ret
+
+        with open(path, "rb") as f:
+            contents = f.read()
         # TODO: mode
-        return (FileOperation.WRITE.value, relpath, contents)
+        return [(FileOperation.WRITE.value, relpath, contents)]
     except FileNotFoundError:
-        return (FileOperation.DELETE.value, relpath)
+        return [(FileOperation.DELETE.value, relpath)]
 
 
 @dataclass
@@ -649,20 +667,21 @@ class Connection:
 
 
 def ops_from_changed_paths(src: str, relpaths: list[str]) -> tuple[list[tuple[Any, ...]], int]:
-    def helper(relpath: str) -> tuple[Any, ...] | None:
+    def helper(relpath: str) -> list[tuple[Any, ...]]:
         return op_from_path(path=dot_safe_join(src, relpath), relpath=relpath)
 
     ops = []
     n_bytes = 0
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        for op in pool.map(helper, relpaths):
-            if op is None:
-                continue
-            if op[0] == FileOperation.WRITE.value:
-                assert isinstance(op[2], bytes)
-                n_bytes += len(op[2])
-            ops.append(op)
+        for some_ops in pool.map(helper, relpaths):
+            for op in some_ops:
+                if op is None:
+                    continue
+                if op[0] == FileOperation.WRITE.value:
+                    assert isinstance(op[2], bytes)
+                    n_bytes += len(op[2])
+                ops.append(op)
 
     return ops, n_bytes
 
@@ -870,6 +889,7 @@ async def sync_watcher_changes(
 
     with Timer("t_local_ops", log_level=1):
         write_ops, n_bytes = ops_from_changed_paths(src=src, relpaths=relpaths_changed)
+        # It's important to process deletes before writes to e.g. handle renames correctly
         ops = delete_ops + write_ops
         log(f"total file size: {n_bytes:_} bytes", level=1)
 
