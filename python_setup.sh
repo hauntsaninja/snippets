@@ -125,7 +125,7 @@ Create a shell with arch -${ARCH_EXPECTED} zsh and try again \
         print_bold_red 'ERROR: pyenv failed to install Python'
         return 1
     fi
-    if ! "$PYENV_ROOT/versions/$PYTHON_VERSION/bin/python" -c 'import hashlib; import ssl'; then
+    if ! "$PYENV_ROOT/versions/$PYTHON_VERSION/bin/python" -c 'import hashlib; import lzma; import ssl'; then
         print_bold_red "ERROR: pyenv failed to correctly build Python, check the log to diagnose. Maybe uninstall libb2 and gettext, run rm -rf $PYENV_ROOT/versions/$PYTHON_VERSION and try again?"
         return 1
     fi
