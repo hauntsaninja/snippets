@@ -6,9 +6,9 @@ import enum
 import functools
 import hashlib
 import importlib
+import marshal
 import math
 import os
-import pickle
 import re
 import shlex
 import shutil
@@ -142,12 +142,34 @@ async def open_connection(
     protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
     sock = get_socket()
     sock.setblocking(False)
-    sock.settimeout(10)
+    sock.settimeout(2)
     sock.connect((host, port))
     sock.settimeout(None)
     transport, _ = await loop.create_connection(lambda: protocol, sock=sock)
     writer = asyncio.StreamWriter(transport, protocol, reader, loop)
     return reader, writer
+
+
+class ConnectionPool:
+    def __init__(self) -> None:
+        self.conns: dict[tuple[str, int], tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
+
+    async def acquire(
+        self, host: str, port: int
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        key = (host, port)
+        if key in self.conns:
+            return self.conns.pop(key)
+        return await open_connection(host, port)
+
+    def release(
+        self, host: str, port: int, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        key = (host, port)
+        if key in self.conns:
+            writer.close()
+            return
+        self.conns[key] = (reader, writer)
 
 
 # ==============================
@@ -185,7 +207,7 @@ class _Entry:
         return stat.S_ISLNK(self.stat.st_mode)
 
     def __reduce__(self) -> tuple[Any, ...]:
-        return (_Entry, (self.path,))
+        raise NotImplementedError
 
 
 def collect_file_size_mtimes(
@@ -202,14 +224,14 @@ def collect_file_size_mtimes(
 
     cache_ver = 217
     cache_dir = os.path.join(tempfile.gettempdir(), "simple_sync")
-    cache_file = f"scan_{hashlib.sha1(path.encode()).hexdigest()}.pkl.zstd"
+    cache_file = f"scan_{hashlib.sha1(path.encode()).hexdigest()}.marshal.zstd"
 
     scandir_cache: dict[str, tuple[float, list[str]]]
     with Timer("cfsm_cache_load", log_level=1):
         try:
             os.makedirs(cache_dir, exist_ok=True)
             with open(os.path.join(cache_dir, cache_file), "rb") as fr:
-                version, scandir_cache = pickle.loads(zstandard.decompress(fr.read()))
+                version, scandir_cache = marshal.loads(zstandard.decompress(fr.read()))
             if version != cache_ver:
                 scandir_cache = {}
         except Exception:
@@ -250,7 +272,7 @@ def collect_file_size_mtimes(
         try:
             with open(os.path.join(cache_dir, cache_file), "wb") as fw:
                 fw.write(
-                    zstandard.compress(pickle.dumps((cache_ver, scandir_cache)), level=ZSTD_LEVEL)
+                    zstandard.compress(marshal.dumps((cache_ver, scandir_cache)), level=ZSTD_LEVEL)
                 )
         except OSError:
             pass
@@ -285,31 +307,29 @@ TreeTopo = dict[tuple[str, int], "TreeTopo"]
 
 
 async def forward_to_topo(
-    topo: TreeTopo, op: ServerOperation, payloads: list[bytes]
+    pool: ConnectionPool, topo: TreeTopo, op: ServerOperation, payloads: list[bytes]
 ) -> list[bytes]:
     async def forward_one(host: str, port: int) -> bytes:
         try:
-            reader, writer = await open_connection(host, port)
+            reader, writer = await pool.acquire(host, port)
             buf = bytearray()
             buf.extend(op.to_bytes(8, byteorder="big"))
             for payload in payloads:
                 write_length_prefixed(buf, payload)
-            write_length_prefixed(buf, pickle.dumps(topo[(host, port)]))
+            write_length_prefixed(buf, marshal.dumps(topo[(host, port)]))
 
             writer.write(buf)
             await writer.drain()
 
             response = await read_length_prefixed_async(reader)
-
-            writer.close()
-            await writer.wait_closed()
+            pool.release(host, port, reader, writer)
         except Exception as e:
             e.add_note(f"Exception occurred forwarding to {host}:{port}")
             raise
 
         return response
 
-    with Timer(f"t_forward to {len(topo)} nodes", log_level=1):
+    with Timer(f"t_forward {op.name} to {len(topo)} nodes", log_level=1):
         ret = await asyncio.gather(*[forward_one(host, port) for (host, port) in topo])
 
     return ret
@@ -359,19 +379,28 @@ class Handler:
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.reader = reader
         self.writer = writer
+        self.pool = ConnectionPool()
         self.version = self_version()
 
     async def healthcheck(self) -> None:
-        topo = pickle.loads(await read_length_prefixed_async(self.reader))
-        for _ in range(50):
+        topo = marshal.loads(await read_length_prefixed_async(self.reader))
+
+        attempt = 0
+        start_t = time.perf_counter()
+        while True:
+            attempt += 1
             try:
-                forward_responses = await forward_to_topo(topo, ServerOperation.HEALTHCHECK, [])
+                forward_responses = await forward_to_topo(
+                    self.pool, topo, ServerOperation.HEALTHCHECK, []
+                )
                 break
             except ConnectionRefusedError as e:
                 log(f"Connection refused when healthchecking, retrying: {e}", level=1)
                 await asyncio.sleep(0.1)
-        else:
-            forward_responses = [b"simplesyncunhealthy"]
+
+            if attempt >= 3 and time.perf_counter() - start_t > 5:
+                forward_responses = [b"simplesyncunhealthy"]
+                break
 
         log(f"forward_responses: {set(forward_responses)}", level=1)
 
@@ -393,16 +422,16 @@ class Handler:
             log(f"payload size: {len(dst_ops_payload):_} bytes", level=1)
 
         with Timer("t_load", log_level=1):
-            dst, ops = pickle.loads(zstandard.decompress(dst_ops_payload))
+            dst, ops = marshal.loads(zstandard.decompress(dst_ops_payload))
             log(f"dst: {dst}", level=1)
             log(f"num ops: {len(ops)}", level=1)
 
         with Timer("t_topo", log_level=1):
-            topo = pickle.loads(await read_length_prefixed_async(self.reader))
+            topo = marshal.loads(await read_length_prefixed_async(self.reader))
             log(f"topo: {topo}", level=2)
 
         forward_task = asyncio.create_task(
-            forward_to_topo(topo, ServerOperation.FILE_BATCH, [dst_ops_payload])
+            forward_to_topo(self.pool, topo, ServerOperation.FILE_BATCH, [dst_ops_payload])
         )
 
         with Timer("t_perform_ops", log_level=1):
@@ -426,9 +455,9 @@ class Handler:
 
     async def list_sizes_some_mtimes(self) -> None:
         with Timer("t_payload_load", log_level=1):
-            dst = pickle.loads(await read_length_prefixed_async(self.reader))
-            need_mtimes = pickle.loads(await read_length_prefixed_async(self.reader))
-            topo = pickle.loads(await read_length_prefixed_async(self.reader))
+            dst = marshal.loads(await read_length_prefixed_async(self.reader))
+            need_mtimes = marshal.loads(await read_length_prefixed_async(self.reader))
+            topo = marshal.loads(await read_length_prefixed_async(self.reader))
             log(f"topo: {topo}", level=2)
 
         with Timer("t_setup", log_level=1):
@@ -438,10 +467,11 @@ class Handler:
             )
             forward_task = asyncio.create_task(
                 forward_to_topo(
+                    self.pool,
                     topo,
                     ServerOperation.LIST_SIZES_SOME_MTIMES,
                     # need_mtimes=False
-                    [pickle.dumps(dst), pickle.dumps(False)],
+                    [marshal.dumps(dst), marshal.dumps(False)],
                 )
             )
 
@@ -456,7 +486,7 @@ class Handler:
 
         with Timer("t_forward_combine", log_level=1):
             for forward_response in forward_responses:
-                remote_sizes = pickle.loads(zstandard.decompress(forward_response))
+                remote_sizes = marshal.loads(zstandard.decompress(forward_response))
                 # symmetric difference of items (missing keys or mismatched values)
                 for relpath, _ in file_sizes.items() ^ remote_sizes.items():
                     file_sizes[relpath] = -1  # something that will never match client
@@ -467,13 +497,14 @@ class Handler:
                 ret: dict[str, Any] = {}
                 for relpath, size in file_sizes.items():
                     if size == -1:
-                        continue
-                    ret[relpath] = (size, file_size_mtimes[relpath][1])
+                        ret[relpath] = (-1, 0)
+                    else:
+                        ret[relpath] = (size, file_size_mtimes[relpath][1])
             else:
                 ret = file_sizes
 
         with Timer("t_dump", log_level=1):
-            response_payload = zstandard.compress(pickle.dumps(ret), level=ZSTD_LEVEL)
+            response_payload = zstandard.compress(marshal.dumps(ret), level=ZSTD_LEVEL)
             log(f"response payload size: {len(response_payload):_} bytes", level=1)
 
         with Timer("t_resp", log_level=1):
@@ -485,9 +516,11 @@ class Handler:
     async def self_kill(self) -> None:
         log("Received self-kill signal...", level=0)
 
-        topo = pickle.loads(await read_length_prefixed_async(self.reader))
+        topo = marshal.loads(await read_length_prefixed_async(self.reader))
         try:
-            forward_responses = await forward_to_topo(topo, ServerOperation.SELF_KILL, [])
+            forward_responses = await forward_to_topo(
+                self.pool, topo, ServerOperation.SELF_KILL, []
+            )
         except Exception as e:
             log(f"Exception when forwarding self-kill: {e}", level=0)
             forward_responses = [b"GOODBYE"]
@@ -544,9 +577,6 @@ class Handler:
                     f"{self.writer._transport.get_extra_info('peername')}",  # type: ignore[attr-defined]
                     level=0,
                 )
-
-                # TODO: we use pickle a fair amount, but this won't work well for non-simple
-                # data types since we're in a different module on the server
 
                 if operation == ServerOperation.HEALTHCHECK:
                     await self.healthcheck()
@@ -650,6 +680,13 @@ class Connection:
     def flat_topo(self) -> TreeTopo:
         return {f: {} for f in self.forwards}
 
+    @property
+    def maybe_l2_topo(self) -> TreeTopo:
+        # magic number comes from benchmarking
+        if len(self.forwards) < 72:
+            return self.flat_topo
+        return self.l2_topo
+
     @functools.cached_property
     def l2_topo(self) -> TreeTopo:
         if len(self.forwards) < 12:
@@ -696,7 +733,7 @@ async def sync_ops(dst: str, ops: list[tuple[Any, ...]], connections: list[Conne
         log(f"... and {len(ops) - 10} more", level=1)
 
     with Timer("t_dump", log_level=1):
-        payload = zstandard.compress(pickle.dumps((dst, ops)), level=ZSTD_LEVEL)
+        payload = zstandard.compress(marshal.dumps((dst, ops)), level=ZSTD_LEVEL)
         log(f"ops payload size: {len(payload):_} bytes", level=1)
 
     with Timer("t_write", log_level=1):
@@ -707,7 +744,7 @@ async def sync_ops(dst: str, ops: list[tuple[Any, ...]], connections: list[Conne
             c.writer.write(buf)
             topobuf = bytearray()
             # flat topo seems fine for most payload sizes, keep it simple and low latency
-            write_length_prefixed(topobuf, pickle.dumps(c.flat_topo))
+            write_length_prefixed(topobuf, marshal.dumps(c.maybe_l2_topo))
             c.writer.write(topobuf)
 
     with Timer("t_drain", log_level=1):
@@ -736,7 +773,7 @@ async def _sync_initial_one(
         log(f"list payload size: {len(payload):_} bytes", level=1)
 
     with Timer("t_load", log_level=1):
-        remote_size_mtimes = pickle.loads(zstandard.decompress(payload))
+        remote_size_mtimes = marshal.loads(zstandard.decompress(payload))
         del payload
 
     with Timer("t_local_sizes_latency", log_level=1):
@@ -812,13 +849,13 @@ async def sync_initial(
     with Timer("t_req_list", log_level=1):
         buf = bytearray()
         buf.extend(ServerOperation.LIST_SIZES_SOME_MTIMES.to_bytes(8, byteorder="big"))
-        write_length_prefixed(buf, pickle.dumps(dst))
-        write_length_prefixed(buf, pickle.dumps(True))
+        write_length_prefixed(buf, marshal.dumps(dst))
+        write_length_prefixed(buf, marshal.dumps(True))
         for c in connections:
             c.writer.write(buf)
             topobuf = bytearray()
             # l2_topo helps here since there's a reduction involved
-            write_length_prefixed(topobuf, pickle.dumps(c.l2_topo))
+            write_length_prefixed(topobuf, marshal.dumps(c.l2_topo))
             c.writer.write(topobuf)
 
         await asyncio.gather(*[c.writer.drain() for c in connections])
@@ -903,17 +940,27 @@ async def sync_watcher_changes(
     )
 
 
+REMOTE_BASE = "/tmp/simple_sync"
+
+
 async def bootstrap(
-    remotes: list[tuple[str, int]], run_callback: Callable[[str, str, str], Awaitable[None]]
+    remotes: list[tuple[str, int]], run_callback: Callable[[list[str], str], Awaitable[None]]
 ) -> None:
-    core_cmd = "cat > /tmp/simple_sync.py; python /tmp/simple_sync.py > /tmp/simple_sync.log 2>&1 &"
+    with open(__file__, "r") as f:
+        code = f.read()
+    core_cmd = (
+        f"mkdir -p {REMOTE_BASE}; "
+        f"cd {REMOTE_BASE}; "
+        f"echo -n {shlex.quote(code)} > simple_sync.py; "
+        "python simple_sync.py > server.log 2>&1 &"
+    )
     bash_cmd = f"nohup bash --login -c {shlex.quote(core_cmd)}"
-    await asyncio.gather(*(run_callback(host, bash_cmd, __file__) for host, _ in remotes))
+    await run_callback([host for host, _port in remotes], bash_cmd)
 
 
 async def establish_bootstrapped_connection(
     remotes: list[tuple[str, int]],
-    run_callback: Callable[[str, str, str], Awaitable[None]],
+    run_callback: Callable[[list[str], str], Awaitable[None]],
     after_bootstrap: bool = False,
 ) -> Connection:
     for _ in range(5):  # arbitrary
@@ -942,7 +989,7 @@ async def establish_bootstrapped_connection(
 
         buf = bytearray()
         buf.extend(ServerOperation.HEALTHCHECK.to_bytes(8, byteorder="big"))
-        write_length_prefixed(buf, pickle.dumps(topo))
+        write_length_prefixed(buf, marshal.dumps(topo))
         writer.write(buf)
         await writer.drain()
 
@@ -969,7 +1016,7 @@ async def establish_bootstrapped_connection(
 
             buf = bytearray()
             buf.extend(ServerOperation.SELF_KILL.to_bytes(8, byteorder="big"))
-            write_length_prefixed(buf, pickle.dumps(topo))
+            write_length_prefixed(buf, marshal.dumps(topo))
             writer.write(buf)
             await writer.drain()
             writer.close()
@@ -994,7 +1041,7 @@ async def client(
     src: str,
     dst: str,
     remote_groups: dict[str, list[tuple[str, int]]],
-    run_callback: Callable[[str, str, str], Awaitable[None]],
+    run_callback: Callable[[list[str], str], Awaitable[None]],
     skip_mtime: bool = False,
 ) -> None:
     print(
