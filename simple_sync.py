@@ -199,6 +199,10 @@ class _Entry:
         return self.stat.st_mtime
 
     @property
+    def mode(self) -> int:
+        return self.stat.st_mode
+
+    @property
     def is_dir(self) -> bool:
         return stat.S_ISDIR(self.stat.st_mode)
 
@@ -210,15 +214,15 @@ class _Entry:
         raise NotImplementedError
 
 
-def collect_file_size_mtimes(
+def collect_file_size_mtime_modes(
     path: str, ignore_cache: GitIgnoreCache
-) -> dict[str, tuple[int, float]]:
+) -> dict[str, tuple[int, float, int]]:
     assert os.path.isabs(path)
-    stats: dict[str, tuple[int, float]] = {}
+    stats: dict[str, tuple[int, float, int]] = {}
     root = _Entry(path)
     try:
         if not root.is_dir:
-            return {".": (root.size, root.mtime)}
+            return {".": (root.size, root.mtime, root.mode)}
     except FileNotFoundError:
         return {}
 
@@ -266,7 +270,7 @@ def collect_file_size_mtimes(
             if item.is_symlink:
                 # TODO: we don't support symlinks
                 continue
-            stats[item.path[prefix_len:]] = (item.size, item.mtime)
+            stats[item.path[prefix_len:]] = (item.size, item.mtime, item.mode)
 
     with Timer("cfsm_cache_dump", log_level=1):
         try:
@@ -291,11 +295,12 @@ def dot_safe_join(base: str, relpath: str) -> str:
 
 
 class ServerOperation(enum.IntEnum):
-    HEALTHCHECK = 3
+    HEALTHCHECK = 17
     FILE_BATCH = 5
     LIST_SIZES_SOME_MTIMES = 7
     SELF_KILL = 11
     BENCHMARK_UPLOAD = 13
+    SERVER_EVENTS = 19
 
 
 class FileOperation(enum.IntEnum):
@@ -340,6 +345,7 @@ def _perform_op(op: tuple[Any, ...], dst: str) -> None:
     if op_type == FileOperation.WRITE:
         path = dot_safe_join(dst, op[1])
         contents = op[2]
+        mode = op[3]
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
         except FileExistsError:
@@ -353,6 +359,8 @@ def _perform_op(op: tuple[Any, ...], dst: str) -> None:
             shutil.rmtree(path, ignore_errors=True)
             with open(path, "wb") as f:
                 f.write(contents)
+        else:
+            os.chmod(path, mode)
     elif op_type == FileOperation.DELETE:
         path = dot_safe_join(dst, op[1])
         log(f"Deleting {path}", level=2)
@@ -376,7 +384,10 @@ def _perform_ops(ops: list[tuple[Any, ...]], dst: str) -> None:
 
 
 class Handler:
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    def __init__(
+        self, server: Server, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        self.server = server
         self.reader = reader
         self.writer = writer
         self.pool = ConnectionPool()
@@ -453,6 +464,8 @@ class Handler:
             self.writer.write(buf)
             await self.writer.drain()
 
+        self.server.sync_events[dst] = time.time_ns()
+
     async def list_sizes_some_mtimes(self) -> None:
         with Timer("t_payload_load", log_level=1):
             dst = marshal.loads(await read_length_prefixed_async(self.reader))
@@ -462,8 +475,8 @@ class Handler:
 
         with Timer("t_setup", log_level=1):
             ignore_cache = GitIgnoreCache()
-            file_size_mtimes_future = asyncio.get_running_loop().run_in_executor(
-                None, collect_file_size_mtimes, dst, ignore_cache
+            file_size_mtime_modes_future = asyncio.get_running_loop().run_in_executor(
+                None, collect_file_size_mtime_modes, dst, ignore_cache
             )
             forward_task = asyncio.create_task(
                 forward_to_topo(
@@ -476,32 +489,33 @@ class Handler:
             )
 
         with Timer("t_file_sizes_latency", log_level=1):
-            file_size_mtimes = await file_size_mtimes_future
+            file_size_mtime_modes = await file_size_mtime_modes_future
 
         with Timer("t_file_sizes_overhead", log_level=1):
-            file_sizes = {k: v[0] for k, v in file_size_mtimes.items()}
+            file_size_modes = {k: (v[0], v[2]) for k, v in file_size_mtime_modes.items()}
 
         with Timer("t_forward_latency", log_level=1):
             forward_responses = await forward_task
 
         with Timer("t_forward_combine", log_level=1):
             for forward_response in forward_responses:
-                remote_sizes = marshal.loads(zstandard.decompress(forward_response))
+                remote_size_modes = marshal.loads(zstandard.decompress(forward_response))
                 # symmetric difference of items (missing keys or mismatched values)
-                for relpath, _ in file_sizes.items() ^ remote_sizes.items():
-                    file_sizes[relpath] = -1  # something that will never match client
+                for relpath, _ in file_size_modes.items() ^ remote_size_modes.items():
+                    file_size_modes[relpath] = (-1, 0)  # something that will never match client
 
         with Timer("t_maybe_mtimes", log_level=1):
             if need_mtimes:
                 # while we reduce sizes, mtimes are only from one node
                 ret: dict[str, Any] = {}
-                for relpath, size in file_sizes.items():
+                for relpath, (size, _) in file_size_modes.items():
                     if size == -1:
-                        ret[relpath] = (-1, 0)
+                        ret[relpath] = (-1, 0, 0)
                     else:
-                        ret[relpath] = (size, file_size_mtimes[relpath][1])
+                        size_mtime_mode = file_size_mtime_modes[relpath]
+                        ret[relpath] = (size, size_mtime_mode[1], size_mtime_mode[2])
             else:
-                ret = file_sizes
+                ret = file_size_modes
 
         with Timer("t_dump", log_level=1):
             response_payload = zstandard.compress(marshal.dumps(ret), level=ZSTD_LEVEL)
@@ -548,6 +562,16 @@ class Handler:
             write_length_prefixed(buf, len(payload).to_bytes(8, byteorder="big"))
             self.writer.write(buf)
             await self.writer.drain()
+
+    async def server_events(self) -> None:
+        events = {
+            "num_connections": len(self.server.handlers),
+            "sync_events": self.server.sync_events,
+        }
+        buf = bytearray()
+        write_length_prefixed(buf, marshal.dumps(events))
+        self.writer.write(buf)
+        await self.writer.drain()
 
     async def handle(self) -> None:
         log(
@@ -598,6 +622,10 @@ class Handler:
                     await self.benchmark_upload()
                     continue
 
+                if operation == ServerOperation.SERVER_EVENTS:
+                    await self.server_events()
+                    continue
+
                 raise AssertionError(f"Unhandled server operation: {operation}")
 
         except ConnectionError as e:
@@ -607,6 +635,19 @@ class Handler:
             import traceback
 
             traceback.print_exc()
+        finally:
+            self.server.handlers.remove(self)
+
+
+class Server:
+    def __init__(self) -> None:
+        self.handlers: set[Handler] = set()
+        self.sync_events: dict[str, float] = {}
+
+    async def handler(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        handler = Handler(self, reader, writer)
+        self.handlers.add(handler)
+        await handler.handle()
 
 
 async def server() -> None:
@@ -615,10 +656,8 @@ async def server() -> None:
     sock.bind(("0.0.0.0", PORT))
     sock.settimeout(None)
 
-    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        await Handler(reader, writer).handle()
-
-    server = await asyncio.start_server(handler, sock=sock, limit=STREAM_READER_LIMIT)
+    s = Server()
+    server = await asyncio.start_server(s.handler, sock=sock, limit=STREAM_READER_LIMIT)
     async with server:
         await server.serve_forever()
 
@@ -642,7 +681,7 @@ def op_from_path(*, path: str, relpath: str) -> list[tuple[Any, ...]]:
             return []
 
         if stat.S_ISDIR(st.st_mode):
-            # collect_file_size_mtimes only deals with files, but it's possible to get directories
+            # collect_file_size_mtime_modes only deals with files, but it's possible to get directories
             # from the file watching loop. In practice, this comes up if a directory was renamed.
             # TODO: this is a little sketchy, doesn't account for gitignore, isn't parallel
             ret = []
@@ -659,8 +698,10 @@ def op_from_path(*, path: str, relpath: str) -> list[tuple[Any, ...]]:
 
         with open(path, "rb") as f:
             contents = f.read()
-        # TODO: mode
-        return [(FileOperation.WRITE.value, relpath, contents)]
+
+        mode = stat.S_IMODE(st.st_mode)
+
+        return [(FileOperation.WRITE.value, relpath, contents, mode)]
     except FileNotFoundError:
         return [(FileOperation.DELETE.value, relpath)]
 
@@ -761,7 +802,7 @@ async def sync_ops(dst: str, ops: list[tuple[Any, ...]], connections: list[Conne
 async def _sync_initial_one(
     src: str,
     dst: str,
-    local_size_mtimes_future: asyncio.Future[dict[str, tuple[int, float]]],
+    local_size_mtime_modes_future: asyncio.Future[dict[str, tuple[int, float, int]]],
     connection: Connection,
     skip_mtime: bool,
     verbose: bool,
@@ -773,11 +814,11 @@ async def _sync_initial_one(
         log(f"list payload size: {len(payload):_} bytes", level=1)
 
     with Timer("t_load", log_level=1):
-        remote_size_mtimes = marshal.loads(zstandard.decompress(payload))
+        remote_size_mtime_modes = marshal.loads(zstandard.decompress(payload))
         del payload
 
     with Timer("t_local_sizes_latency", log_level=1):
-        local_size_mtimes = await local_size_mtimes_future
+        local_size_mtime_modes = await local_size_mtime_modes_future
         if verbose:
             print("Finished local listing, waiting for remote...")
 
@@ -785,17 +826,20 @@ async def _sync_initial_one(
         delete_ops = []
         relpaths_changed = []
         relpaths_maybe_changed = []
-        for relpath, (size, mtime) in local_size_mtimes.items():
-            if relpath not in remote_size_mtimes:
+        for relpath, (size, mtime, mode) in local_size_mtime_modes.items():
+            if relpath not in remote_size_mtime_modes:
                 relpaths_changed.append(relpath)
                 continue
-            if size != remote_size_mtimes[relpath][0]:
+            if size != remote_size_mtime_modes[relpath][0]:
                 relpaths_changed.append(relpath)
                 continue
-            if mtime > remote_size_mtimes[relpath][1]:
+            if mode != remote_size_mtime_modes[relpath][2]:
+                relpaths_changed.append(relpath)
+                continue
+            if mtime > remote_size_mtime_modes[relpath][1]:
                 relpaths_maybe_changed.append(relpath)
                 continue
-        for relpath in remote_size_mtimes.keys() - local_size_mtimes.keys():
+        for relpath in remote_size_mtime_modes.keys() - local_size_mtime_modes.keys():
             delete_ops.append((FileOperation.DELETE.value, relpath))
 
     with Timer("t_local_ops", log_level=1):
@@ -836,7 +880,7 @@ async def _sync_initial_one(
 async def sync_initial(
     src: str,
     dst: str,
-    local_size_mtimes_future: asyncio.Future[dict[str, tuple[int, float]]],
+    local_size_mtime_modes_future: asyncio.Future[dict[str, tuple[int, float, int]]],
     connections: list[Connection],
     skip_mtime: bool,
 ) -> None:
@@ -866,7 +910,7 @@ async def sync_initial(
                 _sync_initial_one(
                     src=src,
                     dst=dst,
-                    local_size_mtimes_future=local_size_mtimes_future,
+                    local_size_mtime_modes_future=local_size_mtime_modes_future,
                     connection=c,
                     skip_mtime=skip_mtime,
                     verbose=(i == 0),
@@ -944,7 +988,8 @@ REMOTE_BASE = "/tmp/simple_sync"
 
 
 async def bootstrap(
-    remotes: list[tuple[str, int]], run_callback: Callable[[list[str], str], Awaitable[None]]
+    remotes: list[tuple[str, int]],
+    run_callback: Callable[[list[tuple[str, int]], str], Awaitable[None]],
 ) -> None:
     with open(__file__, "r") as f:
         code = f.read()
@@ -954,15 +999,15 @@ async def bootstrap(
         f"echo -n {shlex.quote(code)} > simple_sync.py; "
         "python simple_sync.py > server.log 2>&1 &"
     )
-    bash_cmd = f"nohup bash --login -c {shlex.quote(core_cmd)}"
-    await run_callback([host for host, _port in remotes], bash_cmd)
+    bash_cmd = f"nohup /bin/bash --login -c {shlex.quote(core_cmd)}"
+    await run_callback(remotes, bash_cmd)
 
 
 async def establish_bootstrapped_connection(
     remotes: list[tuple[str, int]],
-    run_callback: Callable[[list[str], str], Awaitable[None]],
-    after_bootstrap: bool = False,
+    run_callback: Callable[[list[tuple[str, int]], str], Awaitable[None]],
 ) -> Connection:
+    after_bootstrap = False
     for _ in range(5):  # arbitrary
         remote = remotes[0]
         forwards = remotes[1:]
@@ -997,6 +1042,14 @@ async def establish_bootstrapped_connection(
             prog_version = await read_length_prefixed_async(reader)
         except asyncio.exceptions.IncompleteReadError:
             # Maybe we changed HEALTHCHECK operation ID
+            continue
+        except ConnectionResetError:
+            # We encounter ConnectionResetError in the port forwarding world, as we can connect to
+            # the port but the server isn't running.
+            if not after_bootstrap:
+                # It can take a little bit of time, so loop in the else case
+                await bootstrap(remotes, run_callback)
+            after_bootstrap = True
             continue
 
         if not prog_version.startswith(b"simplesync"):
@@ -1041,14 +1094,14 @@ async def client(
     src: str,
     dst: str,
     remote_groups: dict[str, list[tuple[str, int]]],
-    run_callback: Callable[[list[str], str], Awaitable[None]],
+    run_callback: Callable[[list[tuple[str, int]], str], Awaitable[None]],
     skip_mtime: bool = False,
 ) -> None:
     print(
         f"{'=' * 10} WARNING {'=' * 10}\n"
         "This is a very simple code upload tool with several major downsides:\n"
         "- It doesn't have a command to wait for sync to complete\n"
-        "- It doesn't handle symlinks or permissions\n"
+        "- It doesn't handle symlinks\n"
         "- It's not well tested\n"
         "- It doesn't do anything clever for small deltas to large files\n"
         "\n"
@@ -1063,8 +1116,8 @@ async def client(
 
     print("Bootstrapping...")
     ignore_cache = GitIgnoreCache()
-    local_size_mtimes_future = asyncio.get_running_loop().run_in_executor(
-        None, collect_file_size_mtimes, src, ignore_cache
+    local_size_mtime_modes_future = asyncio.get_running_loop().run_in_executor(
+        None, collect_file_size_mtime_modes, src, ignore_cache
     )
 
     with Timer() as t_bootstrap:
@@ -1084,7 +1137,9 @@ async def client(
     watcher_init = asyncio.ensure_future(anext(watcher))
 
     try:
-        await sync_initial(src, dst, local_size_mtimes_future, connections, skip_mtime=skip_mtime)
+        await sync_initial(
+            src, dst, local_size_mtime_modes_future, connections, skip_mtime=skip_mtime
+        )
         print(f"Watching {src} for changes...\n")
 
         changes = await watcher_init
