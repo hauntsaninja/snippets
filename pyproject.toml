@@ -14,33 +14,39 @@ select = [
     "E", "F", "W", "B", "C4", "PIE", "NPY", "PLE", "PLW",
     "DTZ003", "DTZ004",
     "G010",
-    "PLR1701", "PLR1733", "PLR1736", # "PLR6201",
+    "PLR1733", "PLR1736", # "PLR6201",
     "SIM101", "SIM110", "SIM201", "SIM202", "SIM210", "SIM211", "SIM222", "SIM223", "SIM401",
     "S506",
     "RET501", "RET502", "RET503",
     "RUF006", "RUF007", "RUF008", "RUF013", "RUF016", "RUF017", "RUF200",
     "COM818", "COM819",
     "ISC001",
-    "PYI016", "PYI018", "PYI025",
+    "PYI016", "PYI018", "PYI025", "PYI030",
     "PERF102",
     "UP004", "UP006", "UP007", "UP028", "UP034",
     "FURB132", "FURB148", "FURB163", "FURB181",
     "T100",
-    "PT008", "PT012", "PT014",
-    "ASYNC100", "ASYNC102",  # ASYNC101 checks for open() which is much more debatable
+    "PT008", "PT010", "PT012", "PT014",
+    "ASYNC",
     "ANN2",
+    "TID251",
+    "TCH005",
 ]
 ignore = [
-    "E2",      # leave it to black
-    "E3",      # leave it to black
-    "E402",    # you usually know what you're doing
-    "E501",    # line too long. black does a good enough job
-    "E701",    # multiple statements on one line. black does a good enough job
-    "E731",    # lambda expression assignments. these are nice sometimes
-    "E741",    # variable names like "l". this isn't a huge problem
-    "B011",    # assert false. no one uses python -O
-    "C408",    # can be nice to use dict with keyword args
-    "PIE790",  # there's nothing wrong with pass
+    "E2",     # leave it to black
+    "E3",     # leave it to black
+    "E402",   # you usually know what you're doing
+    "E501",   # line too long. black does a good enough job
+    "E701",   # multiple statements on one line. black does a good enough job
+    # "E711",   # comparison to None is commonly used with SQLAlchemy
+    "E731",   # lambda expression assignments. these are nice sometimes
+    "E741",   # variable names like "l". this isn't a huge problem
+    "B011",   # assert false. no one uses python -O
+    "C408",   # can be nice to use dict with keyword args
+    "C409",   # https://github.com/astral-sh/ruff/issues/12912
+    "C419",   # https://github.com/astral-sh/ruff/issues/10838
+    "C420",   # interesting, but i think reads a little worse to most folks. fromkeys predates dict comprehensions
+    "PIE790", # there's nothing wrong with pass
     "PLW0406", # useful with import *
     "PLW0603", # you usually know what you're doing
     "PLW1509", # PR_SET_PDEATHSIG
@@ -48,6 +54,9 @@ ignore = [
     "PLW1641", # if i want hash, i'll add hash
     "PLW2901", # too pedantic
     "PLW3201", # false positives
+    "SIM108",  # not convinced of the value
+    "ASYNC109",  # not convinced of the value
+    "ASYNC230",  # this is annoying, SSDs are fast
 ]
 unfixable = [
     "F841",   # unused variable. ruff keeps the call, but mostly you want to get rid of it all
@@ -57,6 +66,7 @@ unfixable = [
     "SIM222", # automatic fix might obscure issue
     "SIM223", # automatic fix might obscure issue
     "PT014",  # automatic fix might obscure issue
+    # "PLE4703",  # https://github.com/astral-sh/ruff/issues/10721
 ]
 
 [tool.pylint.main]
