@@ -144,7 +144,7 @@ async def open_connection(
     sock.setblocking(False)
     sock.settimeout(2)
     sock.connect((host, port))
-    sock.settimeout(None)
+    sock.settimeout(120)
     transport, _ = await loop.create_connection(lambda: protocol, sock=sock)
     writer = asyncio.StreamWriter(transport, protocol, reader, loop)
     return reader, writer
@@ -246,11 +246,18 @@ def collect_file_size_mtime_modes(
         if dirname in scandir_cache:
             mtime, names = scandir_cache[dirname]
             if mtime == entry.mtime:
-                return [_Entry(os.path.join(dirname, f)) for f in names]
+                # return [_Entry(os.path.join(dirname, f)) for f in names]
+                return [_Entry(dirname + os.sep + f) for f in names]
         ret = []
         cache_entry = []
         for p in os.scandir(entry.path):
-            ret.append(_Entry(p.path))
+            item = _Entry(p.path)
+            # It's not correct to cache the results post ignore_cache-filtering. If something goes
+            # from gitignored right now to not gitignored later, we'll incorrectly not collect
+            # it later (if parent mtime doesn't change).
+            if ignore_cache(item.path, is_dir=item.is_dir):
+                continue
+            ret.append(item)
             cache_entry.append(p.name)
         scandir_cache[dirname] = (entry.mtime, cache_entry)
         return ret
@@ -260,11 +267,12 @@ def collect_file_size_mtime_modes(
         stack: list[_Entry] = [root]
         while stack:
             item = stack.pop()
-            item_is_dir = item.is_dir
-
-            if ignore_cache(item.path, is_dir=item_is_dir):
-                continue
-            if item_is_dir:
+            # The correct thing to do is call ignore_cache here (and remove it above). If something
+            # goes from not gitignored at cache time to gitignored right now, we'll incorrectly
+            # return it (if parent mtime doesn't change). But this way it's so much faster!
+            # if ignore_cache(item.path, is_dir=item.is_dir):
+            #     continue
+            if item.is_dir:
                 stack.extend(_scandir(item))
                 continue
             if item.is_symlink:
@@ -449,7 +457,11 @@ class Handler:
             await asyncio.get_running_loop().run_in_executor(None, _perform_ops, ops, dst)
 
         with Timer("t_forward_latency", log_level=1):
-            forward_responses = await forward_task
+            try:
+                forward_responses = await forward_task
+            except Exception as e:
+                log(f"Exception when forwarding file batch: {e}", level=0)
+                forward_responses = [b"FAILED"]
 
             if not all(response == b"SYNCED" for response in forward_responses):
                 buf = bytearray()
@@ -773,30 +785,61 @@ async def sync_ops(dst: str, ops: list[tuple[Any, ...]], connections: list[Conne
     if len(ops) > 10:
         log(f"... and {len(ops) - 10} more", level=1)
 
-    with Timer("t_dump", log_level=1):
-        payload = zstandard.compress(marshal.dumps((dst, ops)), level=ZSTD_LEVEL)
-        log(f"ops payload size: {len(payload):_} bytes", level=1)
+    batches = []
+    current_batch = []
+    current_bytes = 0
+    total_bytes = 0
+    for op in ops:
+        if op[0] != FileOperation.WRITE.value:
+            current_batch.append(op)
+            continue
+        if current_bytes + len(op[2]) > 50 * 10**6:  # 50 MB
+            batches.append((current_bytes, current_batch))
+            total_bytes += current_bytes
+            current_batch = [op]
+            current_bytes = len(op[2])
+            continue
+        current_batch.append(op)
+        current_bytes += len(op[2])
 
-    with Timer("t_write", log_level=1):
-        buf = bytearray()
-        buf.extend(ServerOperation.FILE_BATCH.to_bytes(8, byteorder="big"))
-        write_length_prefixed(buf, payload)
-        for c in connections:
-            c.writer.write(buf)
-            topobuf = bytearray()
-            # flat topo seems fine for most payload sizes, keep it simple and low latency
-            write_length_prefixed(topobuf, marshal.dumps(c.maybe_l2_topo))
-            c.writer.write(topobuf)
+    assert current_batch
+    batches.append((current_bytes, current_batch))
+    total_bytes += current_bytes
 
-    with Timer("t_drain", log_level=1):
-        await asyncio.gather(*[c.writer.drain() for c in connections])
+    del ops
 
-    with Timer("t_resp", log_level=1):
-        responses = await asyncio.gather(
-            *[read_length_prefixed_async(c.reader) for c in connections]
-        )
-        if not all(response == b"SYNCED" for response in responses):
-            raise RuntimeError("Failed to sync, check server side logs")
+    sent_bytes = 0
+    for i, (n_bytes, batch) in enumerate(batches):
+
+        with Timer("t_dump", log_level=1):
+            payload = zstandard.compress(marshal.dumps((dst, batch)), level=ZSTD_LEVEL)
+            log(f"ops payload size: {len(payload):_} bytes", level=1)
+
+        with Timer("t_write", log_level=1):
+            buf = bytearray()
+            buf.extend(ServerOperation.FILE_BATCH.to_bytes(8, byteorder="big"))
+            write_length_prefixed(buf, payload)
+            for c in connections:
+                c.writer.write(buf)
+                topobuf = bytearray()
+                # flat topo seems fine for most payload sizes, keep it simple and low latency
+                write_length_prefixed(topobuf, marshal.dumps(c.maybe_l2_topo))
+                c.writer.write(topobuf)
+
+        with Timer("t_drain", log_level=1):
+            await asyncio.gather(*[c.writer.drain() for c in connections])
+
+        sent_bytes += n_bytes
+        if i < len(batches) - 1:
+            print(f"Sent {sent_bytes:_} bytes, {total_bytes - sent_bytes:_} bytes remaining...")
+
+    for _ in range(len(batches)):
+        with Timer("t_resp", log_level=1):
+            responses = await asyncio.gather(
+                *[read_length_prefixed_async(c.reader) for c in connections]
+            )
+            if not all(response == b"SYNCED" for response in responses):
+                raise RuntimeError("Failed to sync, check server side logs")
 
 
 async def _sync_initial_one(
@@ -845,7 +888,6 @@ async def _sync_initial_one(
     with Timer("t_local_ops", log_level=1):
         write_ops, n_bytes = ops_from_changed_paths(src=src, relpaths=relpaths_changed)
         ops = delete_ops + write_ops
-        log(f"total file size: {n_bytes:_} bytes", level=1)
 
     if ops and verbose:
         print(f"Finished remote listing, {len(ops)} files and {n_bytes:_} bytes to sync...")
@@ -861,7 +903,6 @@ async def _sync_initial_one(
 
     with Timer("t_local_ops_mtime", log_level=1):
         ops, n_bytes = ops_from_changed_paths(src=src, relpaths=relpaths_maybe_changed)
-        log(f"total file size: {n_bytes:_} bytes", level=1)
 
     if ops and verbose:
         print(
@@ -882,6 +923,8 @@ async def sync_initial(
     dst: str,
     local_size_mtime_modes_future: asyncio.Future[dict[str, tuple[int, float, int]]],
     connections: list[Connection],
+    *,
+    description: str,
     skip_mtime: bool,
 ) -> None:
     # With our current choice of topology, connections will be a list of size 1
@@ -924,7 +967,7 @@ async def sync_initial(
     t_overall.end()
     print(
         f"Initial sync of {max_files} files and {max_bytes:_} bytes "
-        f"to {sum(c.num_nodes() for c in connections)} nodes "
+        f"to {description} ({sum(c.num_nodes() for c in connections)} nodes) "
         f"completed in {t_overall} at {time.strftime('%H:%M:%S')}\n"
     )
 
@@ -935,6 +978,8 @@ async def sync_watcher_changes(
     connections: list[Connection],
     ignore_cache: GitIgnoreCache,
     changes: set[tuple[watchfiles.Change, str]],
+    *,
+    description: str,
 ) -> None:
     print(f"Detected {len(changes)} changes...")
     t_overall = Timer().start()
@@ -979,7 +1024,7 @@ async def sync_watcher_changes(
     t_overall.end()
     print(
         f"Sync of {len(ops)} files and {n_bytes:_} bytes to "
-        f"{sum(c.num_nodes() for c in connections)} nodes "
+        f"{description} ({sum(c.num_nodes() for c in connections)} nodes) "
         f"completed in {t_overall} at {time.strftime('%H:%M:%S')}\n"
     )
 
@@ -1093,10 +1138,15 @@ async def client(
     *,
     src: str,
     dst: str,
+    # remote_groups: {group: [(host, port)]}
+    # A group is a set of remotes that can connect directly to each other
     remote_groups: dict[str, list[tuple[str, int]]],
+    # run_callback is a function that takes a list of remotes and a command to run on them
     run_callback: Callable[[list[tuple[str, int]], str], Awaitable[None]],
+    description: str,
     skip_mtime: bool = False,
 ) -> None:
+
     print(
         f"{'=' * 10} WARNING {'=' * 10}\n"
         "This is a very simple code upload tool with several major downsides:\n"
@@ -1124,7 +1174,7 @@ async def client(
         connections = await asyncio.gather(
             *[
                 establish_bootstrapped_connection(remotes, run_callback)
-                for _, remotes in remote_groups.items()
+                for remotes in remote_groups.values()
             ]
         )
 
@@ -1138,15 +1188,24 @@ async def client(
 
     try:
         await sync_initial(
-            src, dst, local_size_mtime_modes_future, connections, skip_mtime=skip_mtime
+            src,
+            dst,
+            local_size_mtime_modes_future,
+            connections,
+            skip_mtime=skip_mtime,
+            description=description,
         )
         print(f"Watching {src} for changes...\n")
 
         changes = await watcher_init
-        await sync_watcher_changes(src, dst, connections, ignore_cache, changes)
+        await sync_watcher_changes(
+            src, dst, connections, ignore_cache, changes, description=description
+        )
 
         async for changes in watcher:
-            await sync_watcher_changes(src, dst, connections, ignore_cache, changes)
+            await sync_watcher_changes(
+                src, dst, connections, ignore_cache, changes, description=description
+            )
     finally:
         for c in connections:
             c.writer.close()
@@ -1258,8 +1317,12 @@ class GitIgnoreCache:
                 self._gitignores[plain_child.parts] = self._gitignores[parent.parts]
 
         for m in self._gitignores[path.parts[:-1]]:  # noqa: SIM110
-            if m.match(path, is_dir=is_dir):
-                return True
+            matched = m.match(path, is_dir=is_dir)
+            if matched is not None:
+                return matched
+        # Always ignore .git directories
+        if path.parts[-1] == ".git":
+            return True
         return False
 
 
@@ -1408,7 +1471,7 @@ class GitIgnore:
         batched_rules.append((re.compile("|".join(current_regexp)), current_negation))
         return GitIgnore(batched_rules, dirname)
 
-    def match(self, path: str | _PathParts, is_dir: bool) -> bool:
+    def match(self, path: str | _PathParts, is_dir: bool) -> bool | None:
         if isinstance(path, str):
             path = _PathParts.from_str(path)
         relpath = path.relpath_posix(self._base_path)
@@ -1416,7 +1479,7 @@ class GitIgnore:
             return False
         if is_dir and not relpath.endswith("/"):
             relpath += "/"
-        matched = False
+        matched = None
         for pattern, negation in self._rules:
             if pattern.fullmatch(relpath):
                 matched = not negation
