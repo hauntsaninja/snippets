@@ -20,7 +20,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterator, Protocol
 
 if TYPE_CHECKING:
     import watchfiles
@@ -132,6 +132,7 @@ def get_socket() -> socket.socket:
 
 
 STREAM_READER_LIMIT = 2**24
+CLIENT_TIMEOUT = int(os.environ.get("SHREK_SYNC_TIMEOUT", 30))
 
 
 async def open_connection(
@@ -144,7 +145,7 @@ async def open_connection(
     sock.setblocking(False)
     sock.settimeout(2)
     sock.connect((host, port))
-    sock.settimeout(120)
+    sock.settimeout(CLIENT_TIMEOUT - 1)
     transport, _ = await loop.create_connection(lambda: protocol, sock=sock)
     writer = asyncio.StreamWriter(transport, protocol, reader, loop)
     return reader, writer
@@ -267,12 +268,18 @@ def collect_file_size_mtime_modes(
         stack: list[_Entry] = [root]
         while stack:
             item = stack.pop()
+            try:
+                item_is_dir = item.is_dir
+            except FileNotFoundError:
+                # It's possible but rare that there's some raciness, especially if mtime resolution
+                # in the cache is low
+                continue
             # The correct thing to do is call ignore_cache here (and remove it above). If something
             # goes from not gitignored at cache time to gitignored right now, we'll incorrectly
             # return it (if parent mtime doesn't change). But this way it's so much faster!
-            # if ignore_cache(item.path, is_dir=item.is_dir):
+            # if ignore_cache(item.path, is_dir=item_is_dir):
             #     continue
-            if item.is_dir:
+            if item_is_dir:
                 stack.extend(_scandir(item))
                 continue
             if item.is_symlink:
@@ -685,6 +692,99 @@ def self_version() -> bytes:
 # ==============================
 
 
+class Connection(Protocol):
+    @property
+    def reader(self) -> asyncio.StreamReader: ...
+    @property
+    def writer(self) -> asyncio.StreamWriter: ...
+    async def close(self) -> None: ...
+
+
+@dataclass
+class RawConnection:
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+
+    @classmethod
+    async def connect(cls, remote: tuple[str, int]) -> RawConnection:
+        host, port = remote
+        reader, writer = await open_connection(host, port)
+        return cls(reader, writer)
+
+    async def close(self) -> None:
+        self.writer.close()
+        await self.writer.wait_closed()
+
+
+@dataclass
+class TopoGroup:
+    """A TopoGroup is a set of remotes that can connect directly to each other."""
+
+    name: str
+    # remotes is a list of (host, port) tuples
+    remotes: list[tuple[str, int]]
+    # connection_maker is a function that returns a Connection from the client to
+    # a given (host, port) remote, e.g. RawConnection.connect
+    connection_maker: Callable[[tuple[str, int]], Awaitable[Connection]]
+
+
+@dataclass
+class TopoConnection:
+    conn: Connection
+    leader: tuple[str, int]
+    forwards: list[tuple[str, int]]
+
+    @functools.cached_property
+    def leader_str(self) -> str:
+        return f"{self.leader[0]}:{self.leader[1]}"
+
+    @property
+    def reader(self) -> asyncio.StreamReader:
+        return self.conn.reader
+
+    @property
+    def writer(self) -> asyncio.StreamWriter:
+        return self.conn.writer
+
+    async def close(self) -> None:
+        await self.conn.close()
+
+    @classmethod
+    async def connect(cls, group: TopoGroup) -> TopoConnection:
+        leader, *forwards = group.remotes
+        conn = await group.connection_maker(leader)
+        return cls(conn, leader, forwards)
+
+    def num_nodes(self) -> int:
+        return len(self.forwards) + 1
+
+    @functools.cached_property
+    def flat_topo(self) -> TreeTopo:
+        return {f: {} for f in self.forwards}
+
+    @property
+    def maybe_l2_topo(self) -> TreeTopo:
+        # magic number comes from benchmarking
+        if len(self.forwards) < 72:
+            return self.flat_topo
+        return self.l2_topo
+
+    @functools.cached_property
+    def l2_topo(self) -> TreeTopo:
+        if len(self.forwards) < 12:
+            return self.flat_topo
+
+        # solve for even branching
+        k = int((math.sqrt(4 * len(self.forwards) + 1) - 1) // 2)
+        assert k >= 3
+
+        ret: TreeTopo = {}
+        for i in range(k):
+            ret[self.forwards[i]] = {f: {} for f in self.forwards[k + i :: k]}
+        assert sum(len(v) for v in ret.values()) + len(ret) == len(self.forwards)
+        return ret
+
+
 def op_from_path(*, path: str, relpath: str) -> list[tuple[Any, ...]]:
     try:
         st = os.lstat(path)
@@ -718,44 +818,6 @@ def op_from_path(*, path: str, relpath: str) -> list[tuple[Any, ...]]:
         return [(FileOperation.DELETE.value, relpath)]
 
 
-@dataclass
-class Connection:
-    host: str
-    port: int
-    reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
-    forwards: list[tuple[str, int]]
-
-    def num_nodes(self) -> int:
-        return len(self.forwards) + 1
-
-    @functools.cached_property
-    def flat_topo(self) -> TreeTopo:
-        return {f: {} for f in self.forwards}
-
-    @property
-    def maybe_l2_topo(self) -> TreeTopo:
-        # magic number comes from benchmarking
-        if len(self.forwards) < 72:
-            return self.flat_topo
-        return self.l2_topo
-
-    @functools.cached_property
-    def l2_topo(self) -> TreeTopo:
-        if len(self.forwards) < 12:
-            return self.flat_topo
-
-        # solve for even branching
-        k = int((math.sqrt(4 * len(self.forwards) + 1) - 1) // 2)
-        assert k >= 3
-
-        ret: TreeTopo = {}
-        for i in range(k):
-            ret[self.forwards[i]] = {f: {} for f in self.forwards[k + i :: k]}
-        assert sum(len(v) for v in ret.values()) + len(ret) == len(self.forwards)
-        return ret
-
-
 def ops_from_changed_paths(src: str, relpaths: list[str]) -> tuple[list[tuple[Any, ...]], int]:
     def helper(relpath: str) -> list[tuple[Any, ...]]:
         return op_from_path(path=dot_safe_join(src, relpath), relpath=relpath)
@@ -776,7 +838,7 @@ def ops_from_changed_paths(src: str, relpaths: list[str]) -> tuple[list[tuple[An
     return ops, n_bytes
 
 
-async def sync_ops(dst: str, ops: list[tuple[Any, ...]], connections: list[Connection]) -> None:
+async def sync_ops(dst: str, ops: list[tuple[Any, ...]], connections: list[TopoConnection]) -> None:
     if not ops:
         return
 
@@ -793,7 +855,7 @@ async def sync_ops(dst: str, ops: list[tuple[Any, ...]], connections: list[Conne
         if op[0] != FileOperation.WRITE.value:
             current_batch.append(op)
             continue
-        if current_bytes + len(op[2]) > 50 * 10**6:  # 50 MB
+        if current_bytes + len(op[2]) > 25 * 10**6:  # 25 MB
             batches.append((current_bytes, current_batch))
             total_bytes += current_bytes
             current_batch = [op]
@@ -835,8 +897,9 @@ async def sync_ops(dst: str, ops: list[tuple[Any, ...]], connections: list[Conne
 
     for _ in range(len(batches)):
         with Timer("t_resp", log_level=1):
-            responses = await asyncio.gather(
-                *[read_length_prefixed_async(c.reader) for c in connections]
+            responses = await asyncio.wait_for(
+                asyncio.gather(*[read_length_prefixed_async(c.reader) for c in connections]),
+                timeout=CLIENT_TIMEOUT,
             )
             if not all(response == b"SYNCED" for response in responses):
                 raise RuntimeError("Failed to sync, check server side logs")
@@ -846,7 +909,7 @@ async def _sync_initial_one(
     src: str,
     dst: str,
     local_size_mtime_modes_future: asyncio.Future[dict[str, tuple[int, float, int]]],
-    connection: Connection,
+    connection: TopoConnection,
     skip_mtime: bool,
     verbose: bool,
 ) -> tuple[int, int]:
@@ -858,6 +921,7 @@ async def _sync_initial_one(
 
     with Timer("t_load", log_level=1):
         remote_size_mtime_modes = marshal.loads(zstandard.decompress(payload))
+        assert isinstance(remote_size_mtime_modes, dict)
         del payload
 
     with Timer("t_local_sizes_latency", log_level=1):
@@ -922,7 +986,7 @@ async def sync_initial(
     src: str,
     dst: str,
     local_size_mtime_modes_future: asyncio.Future[dict[str, tuple[int, float, int]]],
-    connections: list[Connection],
+    connections: list[TopoConnection],
     *,
     description: str,
     skip_mtime: bool,
@@ -975,7 +1039,7 @@ async def sync_initial(
 async def sync_watcher_changes(
     src: str,
     dst: str,
-    connections: list[Connection],
+    connections: list[TopoConnection],
     ignore_cache: GitIgnoreCache,
     changes: set[tuple[watchfiles.Change, str]],
     *,
@@ -1049,42 +1113,44 @@ async def bootstrap(
 
 
 async def establish_bootstrapped_connection(
-    remotes: list[tuple[str, int]],
-    run_callback: Callable[[list[tuple[str, int]], str], Awaitable[None]],
-) -> Connection:
+    group: TopoGroup, run_callback: Callable[[list[tuple[str, int]], str], Awaitable[None]]
+) -> TopoConnection:
     after_bootstrap = False
     for _ in range(5):  # arbitrary
-        remote = remotes[0]
-        forwards = remotes[1:]
-        topo: TreeTopo = {f: {} for f in forwards}
-
-        host, port = remote
-
         if after_bootstrap:
-            for _ in range(100):
+            retry_budget = 0.0
+            while True:
                 try:
-                    reader, writer = await open_connection(host, port)
+                    c = await TopoConnection.connect(group)
                     break
-                except ConnectionRefusedError:
+                except ConnectionError as e:
+                    if retry_budget >= 1:
+                        re = RuntimeError(f"Failed to establish connection: {e}")
+                        for note in getattr(e, "__notes__", []):
+                            re.add_note(note)
+                        raise re from e
                     await asyncio.sleep(0.1)
-            else:
-                raise RuntimeError(f"Failed to establish connection with {host}:{port}")
+                    if isinstance(e, ConnectionRefusedError):
+                        retry_budget += 0.01
+                    else:
+                        # Usually some error connecting to SOCKS5 proxy
+                        retry_budget += 0.33
         else:
             try:
-                reader, writer = await open_connection(host, port)
-            except ConnectionRefusedError:
-                await bootstrap(remotes, run_callback)
+                c = await TopoConnection.connect(group)
+            except ConnectionError:
+                await bootstrap(group.remotes, run_callback)
                 after_bootstrap = True
                 continue
 
         buf = bytearray()
         buf.extend(ServerOperation.HEALTHCHECK.to_bytes(8, byteorder="big"))
-        write_length_prefixed(buf, marshal.dumps(topo))
-        writer.write(buf)
-        await writer.drain()
+        write_length_prefixed(buf, marshal.dumps(c.flat_topo))
+        c.writer.write(buf)
+        await c.writer.drain()
 
         try:
-            prog_version = await read_length_prefixed_async(reader)
+            prog_version = await read_length_prefixed_async(c.reader)
         except asyncio.exceptions.IncompleteReadError:
             # Maybe we changed HEALTHCHECK operation ID
             continue
@@ -1093,43 +1159,44 @@ async def establish_bootstrapped_connection(
             # the port but the server isn't running.
             if not after_bootstrap:
                 # It can take a little bit of time, so loop in the else case
-                await bootstrap(remotes, run_callback)
+                await bootstrap(group.remotes, run_callback)
             after_bootstrap = True
             continue
 
         if not prog_version.startswith(b"simplesync"):
-            raise RuntimeError(f"Unknown program running on {host}:{port}: {prog_version!r}")
+            raise RuntimeError(f"Unknown program running on {c.leader_str}: {prog_version!r}")
 
         version = prog_version.removeprefix(b"simplesync")
         if version != self_version():
             if after_bootstrap:
                 raise RuntimeError(
-                    f"Unfixable version mismatch between client and server on {host}:{port}: "
+                    f"Unfixable version mismatch between client and server on {c.leader_str}: "
                     f"client={self_version()!r}, server={version!r}"
                 )
 
             print(
-                f"Detected version mismatch between client and server on {host}:{port}, updating..."
+                f"Detected version mismatch between client and server on {c.leader_str}, updating..."
             )
 
             buf = bytearray()
             buf.extend(ServerOperation.SELF_KILL.to_bytes(8, byteorder="big"))
-            write_length_prefixed(buf, marshal.dumps(topo))
-            writer.write(buf)
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            write_length_prefixed(buf, marshal.dumps(c.flat_topo))
+            c.writer.write(buf)
+            await c.writer.drain()
+            c.writer.close()
+            await c.writer.wait_closed()
             try:
-                assert await read_length_prefixed_async(reader) == b"GOODBYE"
+                assert await read_length_prefixed_async(c.reader) == b"GOODBYE"
             except EOFError:
                 pass
 
             await asyncio.sleep(0.1)  # seems needed to avoid ConnectionResetError :-/
-            await bootstrap(remotes, run_callback)
+            await bootstrap(group.remotes, run_callback)
             after_bootstrap = True
             continue
 
-        return Connection(host=host, port=port, reader=reader, writer=writer, forwards=forwards)
+        log(f"Bootstrapped connection to {c.leader_str}", level=1)
+        return c
 
     raise RuntimeError("Failed to bootstrap connection")
 
@@ -1138,13 +1205,14 @@ async def client(
     *,
     src: str,
     dst: str,
-    # remote_groups: {group: [(host, port)]}
-    # A group is a set of remotes that can connect directly to each other
-    remote_groups: dict[str, list[tuple[str, int]]],
+    # See docstring of TopoGroup
+    remote_groups: list[TopoGroup] | dict[str, list[tuple[str, int]]],
     # run_callback is a function that takes a list of remotes and a command to run on them
     run_callback: Callable[[list[tuple[str, int]], str], Awaitable[None]],
     description: str,
+    on_local_change_event: asyncio.Event | None = None,
     skip_mtime: bool = False,
+    once: bool = False,
 ) -> None:
 
     print(
@@ -1160,8 +1228,13 @@ async def client(
         f"{'=' * 29}\n"
     )
 
-    for group, remotes in remote_groups.items():
-        print(f"Syncing {src} to {dst} on {len(remotes)} remote nodes in {group}...")
+    if isinstance(remote_groups, dict):
+        remote_groups = [
+            TopoGroup(name, remotes, RawConnection.connect)
+            for name, remotes in remote_groups.items()
+        ]
+    for group in remote_groups:
+        print(f"Syncing {src} to {dst} on {len(group.remotes)} remote nodes in {group.name}...")
     print()
 
     print("Bootstrapping...")
@@ -1171,11 +1244,11 @@ async def client(
     )
 
     with Timer() as t_bootstrap:
-        connections = await asyncio.gather(
-            *[
-                establish_bootstrapped_connection(remotes, run_callback)
-                for remotes in remote_groups.values()
-            ]
+        connections = await asyncio.wait_for(
+            asyncio.gather(
+                *[establish_bootstrapped_connection(group, run_callback) for group in remote_groups]
+            ),
+            timeout=CLIENT_TIMEOUT,
         )
 
     print(f"Bootstrapped remote daemons in {t_bootstrap}\n")
@@ -1195,21 +1268,27 @@ async def client(
             skip_mtime=skip_mtime,
             description=description,
         )
+        if once:
+            print("One-time sync completed, exiting...")
+            return
         print(f"Watching {src} for changes...\n")
 
         changes = await watcher_init
+        if on_local_change_event is not None:
+            on_local_change_event.set()
         await sync_watcher_changes(
             src, dst, connections, ignore_cache, changes, description=description
         )
 
         async for changes in watcher:
+            if on_local_change_event is not None:
+                on_local_change_event.set()
             await sync_watcher_changes(
                 src, dst, connections, ignore_cache, changes, description=description
             )
     finally:
         for c in connections:
-            c.writer.close()
-            await c.writer.wait_closed()
+            await c.close()
 
 
 # ==============================
