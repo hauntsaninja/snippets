@@ -132,7 +132,7 @@ def get_socket() -> socket.socket:
 
 
 STREAM_READER_LIMIT = 2**24
-CLIENT_TIMEOUT = int(os.environ.get("SHREK_SYNC_TIMEOUT", 30))
+CLIENT_TIMEOUT = 30
 
 
 async def open_connection(
@@ -313,6 +313,7 @@ class ServerOperation(enum.IntEnum):
     HEALTHCHECK = 17
     FILE_BATCH = 5
     LIST_SIZES_SOME_MTIMES = 7
+    REVERSE_SYNC = 23
     SELF_KILL = 11
     BENCHMARK_UPLOAD = 13
     SERVER_EVENTS = 19
@@ -355,6 +356,17 @@ async def forward_to_topo(
     return ret
 
 
+def _write_atomic_no_follow(path: str, contents: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC
+    tmp_path = path + ".shrek.tmp"
+    fd = os.open(tmp_path, flags)
+    try:
+        os.write(fd, contents)
+    finally:
+        os.close(fd)
+    os.replace(tmp_path, path)
+
+
 def _perform_op(op: tuple[Any, ...], dst: str) -> None:
     op_type = op[0]
     if op_type == FileOperation.WRITE:
@@ -364,18 +376,19 @@ def _perform_op(op: tuple[Any, ...], dst: str) -> None:
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
         except FileExistsError:
-            os.remove(path)
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                os.remove(os.path.dirname(path))  # can happen with symlinks
             os.makedirs(os.path.dirname(path), exist_ok=True)
         log(f"Writing {len(contents)} bytes to {path}", level=2)
         try:
-            with open(path, "wb") as f:
-                f.write(contents)
+            _write_atomic_no_follow(path, contents)
         except IsADirectoryError:
             shutil.rmtree(path, ignore_errors=True)
-            with open(path, "wb") as f:
-                f.write(contents)
+            _write_atomic_no_follow(path, contents)
         else:
-            os.chmod(path, mode)
+            os.chmod(path, mode, follow_symlinks=False)
     elif op_type == FileOperation.DELETE:
         path = dot_safe_join(dst, op[1])
         log(f"Deleting {path}", level=2)
@@ -394,8 +407,22 @@ def _perform_op(op: tuple[Any, ...], dst: str) -> None:
 
 def _perform_ops(ops: list[tuple[Any, ...]], dst: str) -> None:
     # If you're tempted to parallelise this, make sure to handle deletes first
+
+    exc = None  # do our best to perform all ops, even if some fail
     for op in ops:
-        _perform_op(op, dst)
+        try:
+            _perform_op(op, dst)
+        except Exception as e:
+            log(f"Error performing op {op[0]}: {e}", level=0)
+            import traceback
+
+            traceback.print_exc()
+            exc = e
+    if exc:
+        try:
+            raise exc
+        finally:
+            del exc
 
 
 class Handler:
@@ -546,6 +573,37 @@ class Handler:
             self.writer.write(buf)
             await self.writer.drain()
 
+    async def reverse_sync(self) -> None:
+        with Timer("t_payload_load", log_level=1):
+            src = marshal.loads(await read_length_prefixed_async(self.reader))
+            dst = marshal.loads(await read_length_prefixed_async(self.reader))
+            once = marshal.loads(await read_length_prefixed_async(self.reader))
+
+        ignore_cache = GitIgnoreCache()
+        local_size_mtime_modes_future = asyncio.get_running_loop().run_in_executor(
+            None, collect_file_size_mtime_modes, src, ignore_cache
+        )
+
+        connections = [
+            TopoConnection(
+                conn=RawConnection(reader=self.reader, writer=self.writer),
+                leader=("localhost", PORT),
+                forwards=[],
+            )
+        ]
+
+        await _client_bootstrapped(
+            src=src,
+            dst=dst,
+            skip_mtime=False,
+            description="reverse sync",
+            once=once,
+            on_local_change_event=None,
+            ignore_cache=ignore_cache,
+            local_size_mtime_modes_future=local_size_mtime_modes_future,
+            connections=connections,
+        )
+
     async def self_kill(self) -> None:
         log("Received self-kill signal...", level=0)
 
@@ -617,7 +675,8 @@ class Handler:
 
                 log(
                     f"Received operation {server_operation.name} from "
-                    f"{self.writer._transport.get_extra_info('peername')}",  # type: ignore[attr-defined]
+                    f"{self.writer._transport.get_extra_info('peername')} "  # type: ignore[attr-defined]
+                    f"at {time.strftime('%H:%M:%S')}",
                     level=0,
                 )
 
@@ -631,6 +690,10 @@ class Handler:
 
                 if operation == ServerOperation.LIST_SIZES_SOME_MTIMES:
                     await self.list_sizes_some_mtimes()
+                    continue
+
+                if operation == ServerOperation.REVERSE_SYNC:
+                    await self.reverse_sync()
                     continue
 
                 if operation == ServerOperation.SELF_KILL:
@@ -810,6 +873,8 @@ def op_from_path(*, path: str, relpath: str) -> list[tuple[Any, ...]]:
 
         with open(path, "rb") as f:
             contents = f.read()
+        if len(contents) >= 2**31:
+            raise RuntimeError(f"{relpath} is too large to sync")
 
         mode = stat.S_IMODE(st.st_mode)
 
@@ -872,7 +937,6 @@ async def sync_ops(dst: str, ops: list[tuple[Any, ...]], connections: list[TopoC
 
     sent_bytes = 0
     for i, (n_bytes, batch) in enumerate(batches):
-
         with Timer("t_dump", log_level=1):
             payload = zstandard.compress(marshal.dumps((dst, batch)), level=ZSTD_LEVEL)
             log(f"ops payload size: {len(payload):_} bytes", level=1)
@@ -897,10 +961,14 @@ async def sync_ops(dst: str, ops: list[tuple[Any, ...]], connections: list[TopoC
 
     for _ in range(len(batches)):
         with Timer("t_resp", log_level=1):
-            responses = await asyncio.wait_for(
-                asyncio.gather(*[read_length_prefixed_async(c.reader) for c in connections]),
-                timeout=CLIENT_TIMEOUT,
-            )
+            try:
+                responses = await asyncio.wait_for(
+                    asyncio.gather(*[read_length_prefixed_async(c.reader) for c in connections]),
+                    timeout=CLIENT_TIMEOUT,
+                )
+            except asyncio.TimeoutError as e:
+                e.add_note("Timed out, likely due to slow network.")
+                raise
             if not all(response == b"SYNCED" for response in responses):
                 raise RuntimeError("Failed to sync, check server side logs")
 
@@ -1036,18 +1104,9 @@ async def sync_initial(
     )
 
 
-async def sync_watcher_changes(
-    src: str,
-    dst: str,
-    connections: list[TopoConnection],
-    ignore_cache: GitIgnoreCache,
-    changes: set[tuple[watchfiles.Change, str]],
-    *,
-    description: str,
-) -> None:
-    print(f"Detected {len(changes)} changes...")
-    t_overall = Timer().start()
-
+def process_changes(
+    changes: set[tuple[watchfiles.Change, str]], ignore_cache: GitIgnoreCache
+) -> dict[str, watchfiles.Change]:
     change_by_path: dict[str, watchfiles.Change] = {}
     # changes is unordered and may contain duplicates. We deduplicate, preserving added
     # and modified changes over deleted changes (since we'll find out whether the file exists
@@ -1057,22 +1116,31 @@ async def sync_watcher_changes(
             # ignore changes to gitignored files
             continue
         if path in change_by_path:
-            if change in (watchfiles.Change.added, watchfiles.Change.modified):
+            if change in {watchfiles.Change.added, watchfiles.Change.modified}:
                 change_by_path[path] = change
         else:
             change_by_path[path] = change
-    del changes
+    return change_by_path
 
-    if not change_by_path:
-        print("No changes to sync\n")
-        return
+
+async def sync_watcher_changes(
+    src: str,
+    dst: str,
+    connections: list[TopoConnection],
+    change_by_path: dict[str, watchfiles.Change],
+    *,
+    t_overall: Timer,
+    description: str,
+) -> None:
+    assert change_by_path
+    print(f"Detected {len(change_by_path)} changes to sync...")
 
     with Timer("t_local_diff", log_level=1):
         delete_ops = []
         relpaths_changed = []
         for path, change in change_by_path.items():
             relpath = os.path.relpath(path, start=src)
-            if change in (watchfiles.Change.added, watchfiles.Change.modified):
+            if change in {watchfiles.Change.added, watchfiles.Change.modified}:
                 relpaths_changed.append(relpath)
             elif change == watchfiles.Change.deleted:
                 delete_ops.append((FileOperation.DELETE.value, relpath))
@@ -1201,6 +1269,36 @@ async def establish_bootstrapped_connection(
     raise RuntimeError("Failed to bootstrap connection")
 
 
+class ReliableWatch:
+    def __init__(self, src: str) -> None:
+        self.src = src
+        self.watcher = watchfiles.awatch(src, watch_filter=None)
+        # Start running the watcher early so we don't miss any changes
+        self.next_change = asyncio.ensure_future(anext(self.watcher))
+
+    async def get_changes(self) -> set[tuple[watchfiles.Change, str]] | None:
+        while True:
+            done, pending = await asyncio.wait([self.next_change], timeout=60)
+            if done:
+                assert done.pop() is self.next_change
+                ret = await self.next_change
+                self.next_change = asyncio.ensure_future(anext(self.watcher))
+                return ret
+
+            # Just check if the file watcher is working...
+            common_paths = [".git", ".DS_Store", "README.md", "__pycache__"]
+            dummy = next(
+                (absp for p in common_paths if os.path.exists(absp := os.path.join(self.src, p))),
+                None,
+            )
+            if dummy:
+                os.utime(dummy, None)
+
+                done, pending = await asyncio.wait([self.next_change], timeout=2)
+                if pending:
+                    raise RuntimeError("The file watcher seems to have broken. Please restart.")
+
+
 async def client(
     *,
     src: str,
@@ -1233,6 +1331,7 @@ async def client(
             TopoGroup(name, remotes, RawConnection.connect)
             for name, remotes in remote_groups.items()
         ]
+    print()
     for group in remote_groups:
         print(f"Syncing {src} to {dst} on {len(group.remotes)} remote nodes in {group.name}...")
     print()
@@ -1253,42 +1352,100 @@ async def client(
 
     print(f"Bootstrapped remote daemons in {t_bootstrap}\n")
 
-    # Start running the watcher before the initial sync so we don't miss any changes
-    # (also note watchfiles does a little bit of filtering itself that should usually be redundant
-    # with our gitignore filtering)
-    watcher = watchfiles.awatch(src)
-    watcher_init = asyncio.ensure_future(anext(watcher))
+    await _client_bootstrapped(
+        src=src,
+        dst=dst,
+        skip_mtime=skip_mtime,
+        description=description,
+        once=once,
+        on_local_change_event=on_local_change_event,
+        ignore_cache=ignore_cache,
+        local_size_mtime_modes_future=local_size_mtime_modes_future,
+        connections=connections,
+    )
 
+
+async def _client_bootstrapped(
+    *,
+    src: str,
+    dst: str,
+    skip_mtime: bool,
+    description: str,
+    once: bool = False,
+    on_local_change_event: asyncio.Event | None,
+    ignore_cache: GitIgnoreCache,
+    local_size_mtime_modes_future: asyncio.Future[dict[str, tuple[int, float, int]]],
+    connections: list[TopoConnection],
+) -> None:
     try:
-        await sync_initial(
-            src,
-            dst,
-            local_size_mtime_modes_future,
-            connections,
-            skip_mtime=skip_mtime,
-            description=description,
-        )
-        if once:
-            print("One-time sync completed, exiting...")
-            return
-        print(f"Watching {src} for changes...\n")
+        while True:
+            watcher = ReliableWatch(src)
 
-        changes = await watcher_init
-        if on_local_change_event is not None:
-            on_local_change_event.set()
-        await sync_watcher_changes(
-            src, dst, connections, ignore_cache, changes, description=description
-        )
-
-        async for changes in watcher:
-            if on_local_change_event is not None:
-                on_local_change_event.set()
-            await sync_watcher_changes(
-                src, dst, connections, ignore_cache, changes, description=description
+            await sync_initial(
+                src,
+                dst,
+                local_size_mtime_modes_future,
+                connections,
+                skip_mtime=skip_mtime,
+                description=description,
             )
+            if once:
+                print("One-time sync completed, exiting...")
+                return
+            print(f"Watching {src} for changes...\n")
+
+            while True:
+                changes = await watcher.get_changes()
+                if changes is None:
+                    # File watcher is broken, kick back out to initial sync
+                    break
+
+                t_overall = Timer().start()
+                change_by_path = process_changes(changes, ignore_cache)
+                if not change_by_path:
+                    continue
+                if on_local_change_event is not None:
+                    on_local_change_event.set()
+                await sync_watcher_changes(
+                    src,
+                    dst,
+                    connections,
+                    change_by_path,
+                    t_overall=t_overall,
+                    description=description,
+                )
+
     finally:
         for c in connections:
             await c.close()
+
+
+async def client_reverse(
+    src: str,
+    dst: str,
+    remote_group: TopoGroup,
+    run_callback: Callable[[list[tuple[str, int]], str], Awaitable[None]],
+    once: bool,
+) -> None:
+    assert len(remote_group.remotes) == 1
+    connection = await establish_bootstrapped_connection(remote_group, run_callback)
+    print()
+    print(f"Syncing {src} to {dst} from {remote_group.name}...")
+    print()
+
+    buf = bytearray()
+    buf.extend(ServerOperation.REVERSE_SYNC.to_bytes(8, byteorder="big"))
+    write_length_prefixed(buf, marshal.dumps(src))
+    write_length_prefixed(buf, marshal.dumps(dst))
+    write_length_prefixed(buf, marshal.dumps(once))
+    connection.writer.write(buf)
+    await connection.writer.drain()
+
+    server = Server()
+    try:
+        await server.handler(connection.reader, connection.writer)
+    finally:
+        await connection.close()
 
 
 # ==============================
@@ -1472,10 +1629,9 @@ def _rule_from_pattern(pattern: str) -> tuple[str, bool] | None:
     anchored = "/" in pattern[:-1]
     if pattern.startswith("/"):
         pattern = pattern[1:]
-    if pattern.startswith("**"):
-        pattern = pattern[2:]
-        if pattern.startswith("/"):
-            pattern = pattern[1:]
+    if pattern.startswith("**/"):
+        # A leading "**" followed by a slash means match in all directories
+        pattern = pattern[3:]
         anchored = False
 
     assert pattern
@@ -1484,16 +1640,28 @@ def _rule_from_pattern(pattern: str) -> tuple[str, bool] | None:
     def callback(m: re.Match[str]) -> str:
         c = m.group(0)
         if c == "/**/":
+            # A slash followed by two consecutive asterisks then a slash
+            # matches zero or more directories
             return "(?:/|/.+/)"  # a/**/b matches a/b
         if c == "**":
+            # A leading "**" followed by a slash means match in all directories
+            # A trailing "/**" matches everything inside
             if m.start() == 0 or m.end() == n:
                 return ".*"
-            return "[^/]*"  # "other consecutive asterisks"
+            # Other consecutive asterisks are considered regular asterisks
+            return "[^/]*"
+        if c == "/*":
+            # Seemingly undocumented?
+            return "/[^/]+"
         if c == "*":
+            # An asterisk "*" matches anything except a slash
             return "[^/]*"
         if c == "?":
+            # The character "?" matches any one character except "/"
             return "[^/]"
         if c.startswith("[") and c.endswith("]"):
+            # The range notation, e.g. [a-zA-Z], can be used to match one of
+            # the characters in a range. See fnmatch(3) and the FNM_PATHNAME flag
             stuff = c[1:-1]
             if not stuff:
                 return "(?!)"  # empty range: never match
@@ -1502,16 +1670,16 @@ def _rule_from_pattern(pattern: str) -> tuple[str, bool] | None:
                 return "."  # negated empty range: match any character
             if stuff[0] == "!":
                 stuff = "^" + stuff[1:]
-            elif stuff[0] in ("^", "["):
+            elif stuff[0] in {"^", "["}:
                 stuff = "\\" + stuff
             return f"[{stuff}]"
         return re.escape(c)
 
-    regexp = re.sub(r"/\*\*/|\*\*|\*|\?|\[.*\]|.", callback, pattern)
+    regexp = re.sub(r"/\*\*/|\*\*|/\*|\*|\?|\[.*\]|.", callback, pattern)
     if not anchored:
         regexp = "(?:^|.+/)" + regexp
     if pattern.endswith("/"):
-        regexp += "(?:.+)?$"
+        regexp += ".*$"
     else:
         regexp += "(?:/.*)?$"
 
@@ -1533,7 +1701,6 @@ class GitIgnore:
         for line in contents.splitlines():
             if rule := _rule_from_pattern(line):
                 rules.append(rule)
-                pass
         if not rules:
             return None
 
