@@ -59,6 +59,13 @@ def log(msg: str, level: int) -> None:
     print(msg)
 
 
+def exc_repr(e: BaseException) -> str:
+    ret = f"{type(e).__name__}: {e}"
+    if getattr(e, "__notes__", None):
+        ret += f" {e.__notes__}"
+    return ret
+
+
 class Timer:
     def __init__(self, name: str = "", log_level: int | None = None) -> None:
         self._name = name
@@ -219,6 +226,10 @@ def collect_file_size_mtime_modes(
     path: str, ignore_cache: GitIgnoreCache
 ) -> dict[str, tuple[int, float, int]]:
     assert os.path.isabs(path)
+
+    # Important to normalise, since we do some string manipulation on paths in this function
+    path = os.path.normpath(path)
+
     stats: dict[str, tuple[int, float, int]] = {}
     root = _Entry(path)
     try:
@@ -282,9 +293,8 @@ def collect_file_size_mtime_modes(
             if item_is_dir:
                 stack.extend(_scandir(item))
                 continue
-            if item.is_symlink:
-                # TODO: we don't support symlinks
-                continue
+
+            # assert item.path[prefix_len - 1] == os.sep
             stats[item.path[prefix_len:]] = (item.size, item.mtime, item.mode)
 
     with Timer("cfsm_cache_dump", log_level=1):
@@ -322,6 +332,7 @@ class ServerOperation(enum.IntEnum):
 class FileOperation(enum.IntEnum):
     WRITE = 43
     DELETE = 44
+    SYMLINK = 45
 
 
 TreeTopo = dict[tuple[str, int], "TreeTopo"]
@@ -367,28 +378,31 @@ def _write_atomic_no_follow(path: str, contents: bytes) -> None:
     os.replace(tmp_path, path)
 
 
+def _make_dirs_leading_to_path(path: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except FileExistsError:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            os.remove(os.path.dirname(path))  # can happen with symlinks
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+
 def _perform_op(op: tuple[Any, ...], dst: str) -> None:
     op_type = op[0]
     if op_type == FileOperation.WRITE:
         path = dot_safe_join(dst, op[1])
         contents = op[2]
         mode = op[3]
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-        except FileExistsError:
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                os.remove(os.path.dirname(path))  # can happen with symlinks
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+        _make_dirs_leading_to_path(path)
         log(f"Writing {len(contents)} bytes to {path}", level=2)
         try:
             _write_atomic_no_follow(path, contents)
         except IsADirectoryError:
             shutil.rmtree(path, ignore_errors=True)
             _write_atomic_no_follow(path, contents)
-        else:
-            os.chmod(path, mode, follow_symlinks=False)
+        os.chmod(path, mode, follow_symlinks=False)
     elif op_type == FileOperation.DELETE:
         path = dot_safe_join(dst, op[1])
         log(f"Deleting {path}", level=2)
@@ -401,6 +415,18 @@ def _perform_op(op: tuple[Any, ...], dst: str) -> None:
             # If we e.g. renamed a directory, this will be a delete op for the old name
             # Note we should process deletes before writes
             shutil.rmtree(path, ignore_errors=True)
+    elif op_type == FileOperation.SYMLINK:
+        path = dot_safe_join(dst, op[1])
+        target = op[2]
+        _make_dirs_leading_to_path(path)
+        try:
+            os.symlink(target, path)
+        except FileExistsError:
+            try:
+                os.remove(path)
+            except PermissionError:
+                shutil.rmtree(path, ignore_errors=True)
+            os.symlink(target, path)
     else:
         raise ValueError(f"Unknown file operation: {op}")
 
@@ -413,7 +439,7 @@ def _perform_ops(ops: list[tuple[Any, ...]], dst: str) -> None:
         try:
             _perform_op(op, dst)
         except Exception as e:
-            log(f"Error performing op {op[0]}: {e}", level=0)
+            log(f"Error performing op {op[0]}: {exc_repr(e)}", level=0)
             import traceback
 
             traceback.print_exc()
@@ -448,7 +474,10 @@ class Handler:
                 )
                 break
             except ConnectionRefusedError as e:
-                log(f"Connection refused when healthchecking, retrying: {e}", level=1)
+                log(f"Connection refused when healthchecking, retrying: {exc_repr(e)}", level=1)
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                log(f"Exception when healthchecking: {exc_repr(e)}", level=0)
                 await asyncio.sleep(0.1)
 
             if attempt >= 3 and time.perf_counter() - start_t > 5:
@@ -494,7 +523,7 @@ class Handler:
             try:
                 forward_responses = await forward_task
             except Exception as e:
-                log(f"Exception when forwarding file batch: {e}", level=0)
+                log(f"Exception when forwarding file batch: {exc_repr(e)}", level=0)
                 forward_responses = [b"FAILED"]
 
             if not all(response == b"SYNCED" for response in forward_responses):
@@ -613,7 +642,7 @@ class Handler:
                 self.pool, topo, ServerOperation.SELF_KILL, []
             )
         except Exception as e:
-            log(f"Exception when forwarding self-kill: {e}", level=0)
+            log(f"Exception when forwarding self-kill: {exc_repr(e)}", level=0)
             forward_responses = [b"GOODBYE"]
 
         if not all(response == b"GOODBYE" for response in forward_responses):
@@ -711,9 +740,9 @@ class Handler:
                 raise AssertionError(f"Unhandled server operation: {operation}")
 
         except ConnectionError as e:
-            log(f"Connection closed by client: {e}", level=0)
+            log(f"Connection closed by client: {exc_repr(e)}", level=0)
         except Exception as e:
-            log(f"Unexpected error: {e}", level=0)
+            log(f"Unexpected error: {exc_repr(e)}", level=0)
             import traceback
 
             traceback.print_exc()
@@ -852,8 +881,8 @@ def op_from_path(*, path: str, relpath: str) -> list[tuple[Any, ...]]:
     try:
         st = os.lstat(path)
         if stat.S_ISLNK(st.st_mode):
-            # TODO: we don't support symlinks
-            return []
+            link_target = os.readlink(path)
+            return [(FileOperation.SYMLINK.value, relpath, link_target)]
 
         if stat.S_ISDIR(st.st_mode):
             # collect_file_size_mtime_modes only deals with files, but it's possible to get directories
@@ -871,7 +900,7 @@ def op_from_path(*, path: str, relpath: str) -> list[tuple[Any, ...]]:
                     )
             return ret
 
-        with open(path, "rb") as f:
+        with open(path, "rb", buffering=0) as f:
             contents = f.read()
         if len(contents) >= 2**31:
             raise RuntimeError(f"{relpath} is too large to sync")
@@ -1237,10 +1266,16 @@ async def establish_bootstrapped_connection(
         version = prog_version.removeprefix(b"simplesync")
         if version != self_version():
             if after_bootstrap:
-                raise RuntimeError(
-                    f"Unfixable version mismatch between client and server on {c.leader_str}: "
-                    f"client={self_version()!r}, server={version!r}"
-                )
+                if version == b"unhealthy":
+                    raise RuntimeError(
+                        f"At least one node failed bootstrap healthcheck. "
+                        f"Check server side logs on {c.leader_str} to investigate"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Unfixable version mismatch between client and server on {c.leader_str}: "
+                        f"client={self_version()!r}, server={version!r}"
+                    )
 
             print(
                 f"Detected version mismatch between client and server on {c.leader_str}, updating..."
@@ -1317,7 +1352,6 @@ async def client(
         f"{'=' * 10} WARNING {'=' * 10}\n"
         "This is a very simple code upload tool with several major downsides:\n"
         "- It doesn't have a command to wait for sync to complete\n"
-        "- It doesn't handle symlinks\n"
         "- It's not well tested\n"
         "- It doesn't do anything clever for small deltas to large files\n"
         "\n"
