@@ -308,10 +308,76 @@ def collect_file_size_mtime_modes(
     return stats
 
 
+def hash_path(path: str) -> bytes | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return None
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                link_target = os.readlink(path)
+                h = hashlib.sha1()
+                h.update(b"symlink\x00")
+                h.update(link_target.encode(errors="surrogateescape"))
+                return h.digest()
+            except OSError:
+                return None
+        return None
+    else:
+        h = hashlib.sha1()
+        try:
+            f = os.fdopen(fd, "rb", buffering=0)
+        except OSError:
+            os.close(fd)
+            return None
+        try:
+            with f:
+                while True:
+                    chunk = f.read(2**20)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            return h.digest()
+        except OSError:
+            return None
+
+
+def _hash_paths(base: str, relpaths: list[str]) -> dict[str, bytes | None]:
+    def helper(relpath: str) -> tuple[str, bytes | None]:
+        return relpath, hash_path(dot_safe_join(base, relpath))
+
+    ret: dict[str, bytes | None] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for relpath, digest in pool.map(helper, relpaths):
+            ret[relpath] = digest
+    return ret
+
+
+def write_atomic_no_follow(path: str, contents: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC
+    tmp_path = path + ".shrek.tmp"
+    fd = os.open(tmp_path, flags)
+    try:
+        os.write(fd, contents)
+    finally:
+        os.close(fd)
+    os.replace(tmp_path, path)
+
+
 def dot_safe_join(base: str, relpath: str) -> str:
     if relpath == ".":
         return base
     return os.path.join(base, relpath)
+
+
+def portable_mode_key(mode: int) -> int:
+    if stat.S_ISLNK(mode):
+        # symlink permissions are not portable
+        return stat.S_IFMT(mode)
+    return mode
 
 
 # ==============================
@@ -323,6 +389,7 @@ class ServerOperation(enum.IntEnum):
     HEALTHCHECK = 17
     FILE_BATCH = 5
     LIST_SIZES_SOME_MTIMES = 7
+    LIST_HASHES = 29
     REVERSE_SYNC = 23
     SELF_KILL = 11
     BENCHMARK_UPLOAD = 13
@@ -367,17 +434,6 @@ async def forward_to_topo(
     return ret
 
 
-def _write_atomic_no_follow(path: str, contents: bytes) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC
-    tmp_path = path + ".shrek.tmp"
-    fd = os.open(tmp_path, flags)
-    try:
-        os.write(fd, contents)
-    finally:
-        os.close(fd)
-    os.replace(tmp_path, path)
-
-
 def _make_dirs_leading_to_path(path: str) -> None:
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -398,10 +454,10 @@ def _perform_op(op: tuple[Any, ...], dst: str) -> None:
         _make_dirs_leading_to_path(path)
         log(f"Writing {len(contents)} bytes to {path}", level=2)
         try:
-            _write_atomic_no_follow(path, contents)
+            write_atomic_no_follow(path, contents)
         except IsADirectoryError:
             shutil.rmtree(path, ignore_errors=True)
-            _write_atomic_no_follow(path, contents)
+            write_atomic_no_follow(path, contents)
         os.chmod(path, mode, follow_symlinks=False)
     elif op_type == FileOperation.DELETE:
         path = dot_safe_join(dst, op[1])
@@ -424,7 +480,7 @@ def _perform_op(op: tuple[Any, ...], dst: str) -> None:
         except FileExistsError:
             try:
                 os.remove(path)
-            except PermissionError:
+            except (IsADirectoryError, PermissionError):
                 shutil.rmtree(path, ignore_errors=True)
             os.symlink(target, path)
     else:
@@ -602,6 +658,49 @@ class Handler:
             self.writer.write(buf)
             await self.writer.drain()
 
+    async def list_hashes(self) -> None:
+        with Timer("t_payload_load", log_level=1):
+            dst = marshal.loads(await read_length_prefixed_async(self.reader))
+            relpaths = marshal.loads(await read_length_prefixed_async(self.reader))
+            topo = marshal.loads(await read_length_prefixed_async(self.reader))
+            log(f"topo: {topo}", level=2)
+
+        with Timer("t_setup", log_level=1):
+            hash_future = asyncio.get_running_loop().run_in_executor(
+                None, _hash_paths, dst, relpaths
+            )
+            forward_task = asyncio.create_task(
+                forward_to_topo(
+                    self.pool,
+                    topo,
+                    ServerOperation.LIST_HASHES,
+                    [marshal.dumps(dst), marshal.dumps(relpaths)],
+                )
+            )
+
+        with Timer("t_hashes_latency", log_level=1):
+            local_hashes = await hash_future
+
+        with Timer("t_forward_latency", log_level=1):
+            forward_responses = await forward_task
+
+        with Timer("t_forward_combine", log_level=1):
+            for forward_response in forward_responses:
+                remote_hashes = marshal.loads(zstandard.decompress(forward_response))
+                # symmetric difference of items (missing keys or mismatched values)
+                for relpath, _ in local_hashes.items() ^ remote_hashes.items():
+                    local_hashes[relpath] = None
+
+        with Timer("t_dump", log_level=1):
+            response_payload = zstandard.compress(marshal.dumps(local_hashes), level=ZSTD_LEVEL)
+            log(f"response payload size: {len(response_payload):_} bytes", level=1)
+
+        with Timer("t_resp", log_level=1):
+            buf = bytearray()
+            write_length_prefixed(buf, response_payload)
+            self.writer.write(buf)
+            await self.writer.drain()
+
     async def reverse_sync(self) -> None:
         with Timer("t_payload_load", log_level=1):
             src = marshal.loads(await read_length_prefixed_async(self.reader))
@@ -719,6 +818,10 @@ class Handler:
 
                 if operation == ServerOperation.LIST_SIZES_SOME_MTIMES:
                     await self.list_sizes_some_mtimes()
+                    continue
+
+                if operation == ServerOperation.LIST_HASHES:
+                    await self.list_hashes()
                     continue
 
                 if operation == ServerOperation.REVERSE_SYNC:
@@ -1037,7 +1140,9 @@ async def _sync_initial_one(
             if size != remote_size_mtime_modes[relpath][0]:
                 relpaths_changed.append(relpath)
                 continue
-            if mode != remote_size_mtime_modes[relpath][2]:
+            if (mode != remote_size_mtime_modes[relpath][2]) and (
+                portable_mode_key(mode) != portable_mode_key(remote_size_mtime_modes[relpath][2])
+            ):
                 relpaths_changed.append(relpath)
                 continue
             if mtime > remote_size_mtime_modes[relpath][1]:
@@ -1062,13 +1167,61 @@ async def _sync_initial_one(
     if skip_mtime:
         return total_num_ops, total_n_bytes
 
+    maybe_changed_bytes = sum(
+        local_size_mtime_modes[relpath][0] for relpath in relpaths_maybe_changed
+    )
+    use_hashes = maybe_changed_bytes > 25 * 10**6  # 25 MB
+    if use_hashes:
+        if verbose:
+            print(
+                f"The mtime-based sync would send "
+                f"{len(relpaths_maybe_changed)} files and {maybe_changed_bytes:_} bytes; "
+                "filtering by hashes first..."
+            )
+
+        local_hashes_future = asyncio.get_running_loop().run_in_executor(
+            None, _hash_paths, src, relpaths_maybe_changed
+        )
+
+        with Timer("t_req_hashes", log_level=1):
+            buf = bytearray()
+            buf.extend(ServerOperation.LIST_HASHES.to_bytes(8, byteorder="big"))
+            write_length_prefixed(buf, marshal.dumps(dst))
+            write_length_prefixed(buf, marshal.dumps(relpaths_maybe_changed))
+            # l2_topo helps here since there's a reduction involved
+            write_length_prefixed(buf, marshal.dumps(connection.l2_topo))
+            connection.writer.write(buf)
+            await connection.writer.drain()
+
+            payload = await read_length_prefixed_async(connection.reader)
+            log(f"hash list payload size: {len(payload):_} bytes", level=1)
+
+        with Timer("t_load_hashes", log_level=1):
+            remote_hashes = marshal.loads(zstandard.decompress(payload))
+            assert isinstance(remote_hashes, dict)
+
+        with Timer("t_local_hashes_latency", log_level=1):
+            local_hashes = await local_hashes_future
+
+        relpaths_mtime = []
+        for relpath in relpaths_maybe_changed:
+            local_hash = local_hashes.get(relpath)
+            remote_hash = remote_hashes.get(relpath)
+            if local_hash is None or remote_hash is None or local_hash != remote_hash:
+                relpaths_mtime.append(relpath)
+    else:
+        relpaths_mtime = relpaths_maybe_changed
+
     with Timer("t_local_ops_mtime", log_level=1):
-        ops, n_bytes = ops_from_changed_paths(src=src, relpaths=relpaths_maybe_changed)
+        ops, n_bytes = ops_from_changed_paths(src=src, relpaths=relpaths_mtime)
 
     if ops and verbose:
+        sync_label = "mtime-based sync"
+        if use_hashes:
+            sync_label = "mtime-based sync post hash filtering"
         print(
-            "Finished size-based sync, now doing mtime-based sync "
-            "(use --skip-mtime to dangerously not do this), "
+            f"Finished size-based sync, now doing {sync_label} "
+            "(use --skip-mtime to dangerously not do this); "
             f"{len(ops)} files and {n_bytes:_} bytes to sync..."
         )
 
@@ -1661,8 +1814,7 @@ def _rule_from_pattern(pattern: str) -> tuple[str, bool] | None:
     # If there is a separator at the beginning or middle (or both) of the pattern, then the
     # pattern is relative to the directory level of the particular .gitignore file itself
     anchored = "/" in pattern[:-1]
-    if pattern.startswith("/"):
-        pattern = pattern[1:]
+    pattern = pattern.removeprefix("/")
     if pattern.startswith("**/"):
         # A leading "**" followed by a slash means match in all directories
         pattern = pattern[3:]
